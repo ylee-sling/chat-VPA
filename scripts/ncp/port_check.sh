@@ -14,8 +14,8 @@
 #   ar       the autoregressive baseline, the released model's own generate
 #              against REFERENCE/ar/samples.jsonl
 #
-# Identical samples are expected. A stage that differs does not stop the next one; OUT/port_check.txt holds every
-# comparison, and `show` prints it.
+# Identical samples are expected. A stage that differs, or tests that fail or cannot run, do not stop the next
+# stage; OUT/port_check.txt holds every verdict, and `show` prints it.
 #
 #   bash scripts/ncp/port_check.sh          start in a detached tmux session (SESSION) and return
 #   bash scripts/ncp/port_check.sh run      run in the foreground
@@ -82,8 +82,17 @@ run() {
     case "$stage" in
       tests)
         log "tests: the repository's suite in this environment"
-        if run_tests; then echo "== tests: passed" | tee -a "$RESULT"; else echo "== tests: FAILED" | tee -a "$RESULT"; fi
-        echo >> "$RESULT" ;;
+        local status=0
+        run_tests "$OUT/tests.txt" || status=$?
+        {
+          case "$status" in
+            0)   echo "== tests: passed ($(tail -n 1 "$OUT/tests.txt"))" ;;
+            127) echo "== tests: NOT RUN: pytest is missing in $PY's environment (add it there and tell the author)" ;;
+            *)   echo "== tests: FAILED (pytest's exit status $status); the end of $OUT/tests.txt:"
+                 tail -n 25 "$OUT/tests.txt" ;;
+          esac
+          echo
+        } | tee -a "$RESULT" ;;
       canvas)
         log "canvas: the ported whole-canvas sampler, K = $K, exact kernel"
         "$PY" -m chat_vpa.evaluate --decoder realizer --checkpoint "$CHECKPOINT" --k-steps "$K" --orders random \

@@ -83,10 +83,17 @@ print(f"python {sys.version.split()[0]}, torch {torch.__version__}, transformers
 PYEOF
 }
 
-# run_tests: the repository's test suite in this environment (about a minute on the CPU).
+# run_tests [file]: the repository's test suite in this environment (about a minute on the CPU), its output also
+# written to file. Returns pytest's exit status, or 127 if pytest is missing; it never ends the calling script, so
+# a check that runs the tests first still runs its other stages.
 run_tests() {
-  "$PY" -c "import pytest" 2>/dev/null || die "pytest is missing in $PY's environment (add it and tell the author)"
-  "$PY" -m pytest -q -p no:cacheprovider --basetemp "$TMPDIR/pytest"
+  local out="${1:-/dev/null}"
+  if ! "$PY" -c "import pytest" 2>/dev/null; then
+    echo "pytest is missing in $PY's environment" | tee "$out" >&2
+    return 127
+  fi
+  "$PY" -m pytest -q -p no:cacheprovider --basetemp "$TMPDIR/pytest" 2>&1 | tee "$out"
+  return "${PIPESTATUS[0]}"
 }
 
 # check_gpu_free: one GPU job at a time.
