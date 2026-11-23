@@ -76,7 +76,9 @@ predecessor's `text-vpa/1`. The payload's layout is unchanged.
 - **Documents:** `docs/stage0.md` and `docs/stage1.md` are not copied. They remain the record of the Stage 0
   design, of both Stage 0 runs and of the oracle experiments:
   https://github.com/ylee-sling/text-VPA/blob/6f97346/docs/stage0.md and `.../docs/stage1.md`. Comments in the
-  imported code that cite "decision N" refer to `docs/stage0.md` there.
+  imported code that cite "decision N" refer to `docs/stage0.md` there. They stay references, not copies, and the
+  Chat-VPA preprint PDF stays out of the repository, in the author's project files (the author's decisions,
+  23 November 2026).
 
 ## Tests before and after
 

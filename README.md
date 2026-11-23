@@ -45,11 +45,12 @@ The numbers that motivate the design are measurements of the predecessor (text-V
 The first experiment is **E0**, the bridge experiment of the preprint's Sec. 6.2: Block-DFM on the frozen
 Gemma 4 E2B, trained under the staircase block-causal mask on human references or on the backbone's own
 autoregressive rollouts, evaluated on MBPP's validation split. Its pre-registration is
-[`docs/e0.md`](docs/e0.md) on branch `e0`, a draft whose open choices are the author's; no training starts
-before he has confirmed it. Three checks on the L4 come first (`bash scripts/ncp/first_checks.sh`, then
-`bash scripts/ncp/first_checks.sh show`): the ported code against the predecessor's samples, the throughput of
-autoregressive rollouts, and the block machinery on the real weights. What the preprint draft is known to get
-wrong is listed in [`docs/preprint-corrections.md`](docs/preprint-corrections.md).
+[`docs/e0.md`](docs/e0.md) on branch `e0`, confirmed by the author except C6, the data; no training starts before
+C6 is decided. Three checks on the L4 came first (`bash scripts/ncp/first_checks.sh`, then
+`bash scripts/ncp/first_checks.sh show`): the ported code against the predecessor's samples (identical, 450 of
+450 in all three paths), the throughput of autoregressive rollouts, and the block machinery on the real weights.
+What the preprint draft is known to get wrong is listed in
+[`docs/preprint-corrections.md`](docs/preprint-corrections.md).
 
 ## Install and test
 

@@ -9,11 +9,12 @@ before changing any math, and cite the equation in a comment. `docs/preprint-cor
 is known to get wrong (the "two tokens per pass" reading of K = 128, the finished latent oracle, two points of
 Table 5): do not repeat those statements, and do not edit the preprint unasked.
 
-**Status: nothing of Chat-VPA has been measured.** The code on `main` is text-VPA's verified Stage 0 code
-(`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the Block-DFM
-core, its tests, the rollout generator and the checks for the L4 exist; the trainer does not, and nothing is
-trained before the author has confirmed `docs/e0.md` (a draft: every choice in its Section 3 is open until its
-Section 9 records the author's decision).
+**Status: no Chat-VPA model has been trained or measured.** The code on `main` is text-VPA's verified Stage 0
+code (`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the
+Block-DFM core, its tests, the rollout generator and the checks for the L4 exist, and the checks have run (the port
+is exact: `docs/e0.md`, Section 2.4); the trainer and the rollout writer do not exist yet. The author has confirmed
+`docs/e0.md` except C6, the data, which waits for an inspection of the `write` rollouts; nothing is trained and no
+rollout is stored as a training target before C6 is decided.
 
 ## Layout
 
@@ -35,8 +36,9 @@ Section 9 records the author's decision).
 | `chat_vpa/block_objective.py` | Eq. 12 | `dfm_loss` (L_DFM); L_Block-KD, L_Boundary, L_Step, L_Plan are not built |
 | `chat_vpa/block_sampler.py` | Algorithm 1, Prop. 3 | `sample_blocks`: fused commit, exact kernel / prefix / confidence orders, early exit, stopping, passes per block (K-bar), the audit |
 | `chat_vpa/block_evaluate.py`, `compare_samples.py` | Sec. 6.2 | Pass@k of the block sampler in `evaluate.py`'s format, the cache spot check; sample-by-sample comparison of two evaluations |
-| `chat_vpa/rollouts.py`, `rollout_throughput.py` | Sec. 4.1, Cor. 1, Sec. 6.2 | batched AR rollouts of the frozen backbone as training targets; the entropy of the decoding distribution along a target; the throughput measurement |
-| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh`, `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back) |
+| `chat_vpa/rollouts.py`, `rollout_throughput.py` | Sec. 4.1, Cor. 1, Sec. 6.2 | batched AR rollouts of the frozen backbone as training targets; the entropy of the decoding distribution along a target; the throughput measurement (`--kind` for one prompt format; writes `rollouts.jsonl`) |
+| `chat_vpa/inspect_rollouts.py` | | how the rollouts of a throughput run ended: for `write` prompts, where the named function ends and what follows it (a diagnostic for C6; changes no rule) |
+| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` (`inspect` runs `inspect_rollouts.py` on its output), `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back) |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
 | `docs/provenance.md` | | what was imported from text-VPA at `6f97346`, what changed, what was dropped; the corpus |
@@ -138,9 +140,9 @@ ruff check .                            # must pass
 
 ## Decisions where the paper is silent (do not change silently)
 
-Made while building the Block-DFM core (23 November 2026). Those marked *(E0)* are open choices of the first
-experiment as well: `docs/e0.md` lists them with their alternatives, and they stand as defaults until the author
-has confirmed them there.
+Made while building the Block-DFM core (23 November 2026). Those marked *(E0)* are choices of the first experiment
+as well, listed in `docs/e0.md` with their alternatives; the author confirmed them on 23 November 2026 (C8, C9),
+except the rollout targets, which belong to C6 and are open.
 
 - **Local blocks inside a window.** Eq. 5 says the sliding window "applies on top of M" and that a window always
   lies inside it. The code keeps the two-sided rule |n(u) - n(v)| < W of the Stage 0 realizer among window rows
