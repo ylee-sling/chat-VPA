@@ -54,6 +54,8 @@ def test_a_block_spanning_the_canvas_reproduces_the_whole_canvas_evaluator(run, 
         assert compare_samples.main([str(canvas), str(block)]) == 0
         printed = capsys.readouterr().out
         assert "identical raw text: 6/6 (100.0%)" in printed and "RESULT: identical" in printed
+        assert "settings recorded by both: equal" in printed
+        assert compare_samples.setting_differences(canvas, block) == []
         a, b = compare_samples.load_samples(canvas), compare_samples.load_samples(block)
         assert len(a) == 6 and all(a[key]["raw"] == b[key]["raw"] and a[key]["passed"] == b[key]["passed"] for key in a)
         assert len({row["raw"] for row in a.values()}) > 1                       # not one degenerate text
@@ -63,7 +65,19 @@ def test_a_block_spanning_the_canvas_reproduces_the_whole_canvas_evaluator(run, 
     # Samples of another K differ, and the comparison says so.
     other = run / "block" / "mbpp" / "block-B32-K4" / "samples.jsonl"
     assert compare_samples.main([str(canvas), str(other)]) == 1
-    assert "RESULT: DIFFERENT" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "RESULT: DIFFERENT" in printed
+    # ... and that the two were not run with the same settings: the summaries next to the samples are compared.
+    steps_of = json.loads(canvas.with_name("summary.json").read_text())["num_steps"]
+    assert compare_samples.setting_differences(canvas, other) == [("num_steps", steps_of, 4)]
+    assert f"SETTINGS DIFFER (the samples are not expected to agree): num_steps {steps_of} against 4" in printed
+    # Without a summary next to a file the settings are not compared, and the comparison says so.
+    alone = run / "alone" / "samples.jsonl"
+    alone.parent.mkdir()
+    alone.write_text(other.read_text())
+    assert compare_samples.setting_differences(alone, other) is None
+    assert compare_samples.main([str(alone), str(other)]) == 0
+    assert "settings: not compared" in capsys.readouterr().out
 
 
 def test_short_blocks_under_the_pass_audit_with_a_cache_check(run):

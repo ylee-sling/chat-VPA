@@ -10,6 +10,10 @@ Reads two ``samples.jsonl`` files of ``evaluate.py`` or ``block_evaluate.py`` an
 the agreement rates and the first samples that differ, and exits with status 0 only if every raw text is equal.
 The port check of docs/provenance.md uses it: the ported code, with the predecessor's checkpoint, settings and
 seeds, must reproduce the predecessor's samples.
+
+If a ``summary.json`` lies next to each file, the settings both record (token draw, seed, split, token budget,
+schedule, steps) are compared as well, and those that differ are printed: samples of two different settings are
+not expected to agree, and the result should not be read as a defect of the code.
 """
 
 from __future__ import annotations
@@ -20,7 +24,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-__all__ = ["compare", "load_samples"]
+__all__ = ["compare", "load_samples", "setting_differences"]
+
+# Settings that decide the samples and that both evaluators record under the same name. The reveal order is not
+# among them: the whole-canvas sampler calls the exact kernel "random" and the block sampler "exact".
+SETTINGS = ("benchmark", "split", "problems", "samples_per_problem", "seed", "temperature", "top_p", "top_k",
+            "canvas_len", "max_new_tokens", "schedule", "num_steps", "adapters", "step")
 
 
 def load_samples(path: str | Path) -> dict[tuple[str, int], dict[str, Any]]:
@@ -53,6 +62,19 @@ def compare(first: dict[tuple[str, int], dict[str, Any]], second: dict[tuple[str
             "first_differences": different[:5]}
 
 
+def setting_differences(first: str | Path, second: str | Path) -> list[tuple[str, Any, Any]] | None:
+    """(name, first value, second value) of every setting recorded by both ``summary.json`` files next to the two
+    sample files that differs; None if either summary is missing."""
+    summaries = []
+    for path in (first, second):
+        summary = Path(path).with_name("summary.json")
+        if not summary.exists():
+            return None
+        summaries.append(json.loads(summary.read_text(encoding="utf-8")))
+    a, b = summaries
+    return [(name, a[name], b[name]) for name in SETTINGS if name in a and name in b and a[name] != b[name]]
+
+
 def _where(a: str, b: str) -> int:
     for index, (x, y) in enumerate(zip(a, b, strict=False)):
         if x != y:
@@ -72,6 +94,14 @@ def main(argv: list[str] | None = None) -> int:
     identical = (result["samples"] > 0 and result["identical_raw"] == result["samples"]
                  and not result["only_in_first"] and not result["only_in_second"])
     print(f"{args.first}\n{args.second}")
+    settings = setting_differences(args.first, args.second)
+    if settings is None:
+        print("  settings: not compared (a summary.json is missing next to one of the files)")
+    elif settings:
+        print("  SETTINGS DIFFER (the samples are not expected to agree): "
+              + "; ".join(f"{name} {x!r} against {y!r}" for name, x, y in settings))
+    else:
+        print("  settings recorded by both: equal")
     print(f"  samples compared: {result['samples']} ({result['tasks']} problems; only in the first: "
           f"{result['only_in_first']}, only in the second: {result['only_in_second']})")
     print(f"  identical raw text: {result['identical_raw']}/{result['samples']} ({100 * result['raw_agreement']:.1f}%); "

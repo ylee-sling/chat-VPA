@@ -26,6 +26,11 @@ cd "$ROOT"
 
 unset PYTHONPATH PYTHONHOME PYTHONSTARTUP VIRTUAL_ENV CONDA_PREFIX
 export PYTHONNOUSERSITE=1 TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_TELEMETRY=1 PYTHONUNBUFFERED=1
+# Nothing is written outside runs/: no bytecode next to the sources, temporary files (the harness's program
+# directories, pytest's) under runs/tmp, and no download (checkpoint and data are local).
+export PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export TMPDIR="$ROOT/runs/tmp"
+mkdir -p "$TMPDIR"
 # Expandable segments keep the caching allocator from failing on fragmentation when batches of varying shape
 # follow each other.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -76,6 +81,12 @@ x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
 print(f"python {sys.version.split()[0]}, torch {torch.__version__}, transformers {transformers.__version__}, "
       f"{torch.cuda.get_device_name(0)}, {torch.cuda.get_device_properties(0).total_memory / 2**30:.1f} GiB")
 PYEOF
+}
+
+# run_tests: the repository's test suite in this environment (about a minute on the CPU).
+run_tests() {
+  "$PY" -c "import pytest" 2>/dev/null || die "pytest is missing in $PY's environment (add it and tell the author)"
+  "$PY" -m pytest -q -p no:cacheprovider --basetemp "$TMPDIR/pytest"
 }
 
 # check_gpu_free: one GPU job at a time.
