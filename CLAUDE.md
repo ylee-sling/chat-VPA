@@ -47,8 +47,16 @@ ruff check .                            # must pass
 6. **Every number in a document says what it is:** measured (by which run), reported (by which source) or
    predicted (by which model).
 7. **The author decides** the license, the open choices of an experiment and any deviation from the preprint.
-   Ask first; record every decision in `docs/` with its date.
+   Ask first; record every decision in `docs/` with its date. Everything else is decided without asking (the
+   author's request of 23 November 2026): routine engineering, repository formatting and minor implementation
+   choices are made, recorded where they belong and reported, not proposed. Pause for the author only when a
+   decision affects a pre-registered protocol, a scientific conclusion or a significant amount of GPU time.
 8. **Git:** `main` holds the import; work on E0 goes to branch `e0`; pull requests when the author asks.
+9. **Commit trailers** (the author's request of 23 November 2026). Every commit message ends with one block of
+   trailers, with no blank line inside it (git and GitHub read only the last paragraph as trailers): first
+   `Co-authored-by: Yeonseok Lee <ylee@sling.ai.kr>`, then the attribution lines that the session's instructions
+   give. The commits up to `2076e2d` on `main` and `cfb51e7` on `e0` lack the first line; they are not rewritten
+   or force-pushed unless the author asks.
 
 ## Rules of the code (text-VPA's Stage 0 rules, for E0)
 
