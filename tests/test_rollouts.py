@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import Counter
 
 import pytest
 import torch
@@ -20,7 +21,7 @@ if not hasattr(transformers, "Gemma4ForConditionalGeneration"):      # pragma: n
 from test_stage0 import MASK, VOCAB, CharTokenizer, _write_corpus, tiny_realizer  # noqa: E402
 from test_stage0_cli import write_checkpoint  # noqa: E402
 
-from chat_vpa import rollout_throughput  # noqa: E402
+from chat_vpa import inspect_rollouts, rollout_throughput  # noqa: E402
 from chat_vpa.autoregressive import cut_at_eos  # noqa: E402
 from chat_vpa.backbone import load_gemma4  # noqa: E402
 from chat_vpa.data import Example, HFTokenizer, collate, tokenize_examples  # noqa: E402
@@ -210,7 +211,7 @@ def test_throughput_cli_on_the_tiny_model(tmp_path, capsys):
             "--max-prompt-tokens", "128", "--top-k", "50", "--temperature", "1.0", "--check-every", "4",
             "--entropy-batch", "5", "--examples", "3", "--device", "cpu"]
     assert rollout_throughput.main(args) == 0
-    assert sorted(p.name for p in out.iterdir()) == ["examples.txt", "throughput.json"]      # and nothing else
+    assert sorted(p.name for p in out.iterdir()) == ["examples.txt", "rollouts.jsonl", "throughput.json"]  # only these
     result = json.loads((out / "throughput.json").read_text())
     assert result["prompts"]["count"] == 12 and sum(result["prompts"]["kinds"].values()) == 12
     assert result["settings"]["sorted_by_prompt_length"] is True and result["settings"]["max_new_tokens"] == 24
@@ -233,9 +234,39 @@ def test_throughput_cli_on_the_tiny_model(tmp_path, capsys):
         assert "entropy_per_token" not in entropy["references"] and entropy["references"]["nll_per_token"] > 0
     text = (out / "examples.txt").read_text()
     assert text.count("===== example") == 3 and "----- human reference" in text and "----- rollout" in text
+    # Every rollout of the best batch size, in the examples' order, with the stops that batch size counted.
+    rows = [json.loads(line) for line in (out / "rollouts.jsonl").read_text().splitlines()]
+    assert [r["index"] for r in rows] == list(range(12))
+    assert all(set(r) == {"index", "kind", "stop", "generated", "kept", "prompt", "reference", "text"} for r in rows)
+    assert dict(Counter(r["kind"] for r in rows)) == result["prompts"]["kinds"]
+    best_entry = next(e for e in result["batch_sizes"] if e["batch_size"] == best["batch_size"])
+    for stop, share in best_entry["stops"].items():
+        assert sum(r["stop"] == stop for r in rows) == round(12 * share)
+    assert all(r["kept"] == (r["stop"] in ("truncation", "eos")) for r in rows)
+    # examples.txt holds the first three of them, and reads back as the same records.
+    assert inspect_rollouts.parse_examples_text(text) == rows[:3]
     capsys.readouterr()
+    assert inspect_rollouts.main([str(out / "rollouts.jsonl"), str(out / "examples.txt")]) == 0
+    inspected = capsys.readouterr().out
+    assert inspected.count("rollouts (a diagnostic; no rule is changed)") == 2
+    assert inspected.count("\nwrite: ") == inspected.count("\ncomplete: ") == 2
     assert rollout_throughput.main(["--show", str(out)]) == 0
     shown = capsys.readouterr().out
-    assert "best batch size" in shown and "projected" in shown
+    assert "best batch size" in shown and "projected" in shown and "only '" not in shown
     with pytest.raises(SystemExit):
         rollout_throughput.main(["--out", str(out)])
+
+    # --kind: the first prompts of one format, and how many stream examples were read to find them.
+    only = tmp_path / "runs" / "write"
+    narrowed = [only if a == str(out) else a for a in args]
+    narrowed[narrowed.index("--batch-sizes") + 1: narrowed.index("--batch-sizes") + 3] = ["6"]
+    assert rollout_throughput.main([*map(str, narrowed), "--kind", "write"]) == 0
+    result = json.loads((only / "throughput.json").read_text())
+    assert result["prompts"]["kinds"] == {"write": 12} and result["settings"]["kind"] == "write"
+    read = result["prompts"]["stream_examples_read"]
+    assert read > 12
+    rows = [json.loads(line) for line in (only / "rollouts.jsonl").read_text().splitlines()]
+    assert len(rows) == 12 and {r["kind"] for r in rows} == {"write"}
+    capsys.readouterr()
+    assert rollout_throughput.main(["--show", str(only)]) == 0
+    assert f"only 'write' prompts: the first 12 of {read} stream examples" in capsys.readouterr().out

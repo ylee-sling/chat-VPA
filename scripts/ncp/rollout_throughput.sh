@@ -4,18 +4,21 @@
 #
 # rollout_throughput.sh -- how many autoregressive rollouts of the frozen backbone are affordable (about 15
 # minutes on the L4; chat_vpa/rollout_throughput.py says what is measured). It reads text-VPA's checkpoint and
-# corpus, writes OUT/throughput.json and OUT/examples.txt (and, when started in tmux, OUT/throughput.log),
-# stores no rollout for training and executes no generated code.
+# corpus, writes OUT/throughput.json, OUT/examples.txt and OUT/rollouts.jsonl (and, when started in tmux,
+# OUT/throughput.log), stores no rollout as a training target and executes no generated code.
 #
 #   bash scripts/ncp/rollout_throughput.sh          start in a detached tmux session (SESSION) and return
 #   bash scripts/ncp/rollout_throughput.sh run      run in the foreground
 #   bash scripts/ncp/rollout_throughput.sh show     print the summary of a finished measurement
+#   bash scripts/ncp/rollout_throughput.sh inspect  how its rollouts ended (chat_vpa/inspect_rollouts.py), from
+#                                                   OUT/rollouts.jsonl, or OUT/examples.txt for an earlier run
 #
 # Variables (defaults in brackets; scripts/ncp/env.sh has the server's):
 #   OUT          [runs/e0-throughput]     must lie under this repository's runs/
 #   NUM_PROMPTS  [256]                    the first training examples in CorpusStream order
 #   BATCH_SIZES  [16 32 64 128]           tried in this order; stops at the first that runs out of memory
-#   EXTRA_ARGS   []                       further arguments of chat_vpa.rollout_throughput, e.g. --no-sort
+#   EXTRA_ARGS   []                       further arguments of chat_vpa.rollout_throughput, e.g. --no-sort, or
+#                                         "--kind write --examples 64" for the write prompts only
 #   SESSION      [e0-throughput]
 # Never shuts the server down.
 set -euo pipefail
@@ -51,5 +54,9 @@ case "${1:-launch}" in
   run)    run ;;
   show)   [[ -f "$OUT/throughput.json" ]] || die "$OUT/throughput.json is missing: the measurement has not finished"
           "$PY" -m chat_vpa.rollout_throughput --show "$OUT" ;;
-  *)      die "usage: rollout_throughput.sh [launch|run|show]" ;;
+  inspect) source_file="$OUT/rollouts.jsonl"
+          [[ -f "$source_file" ]] || source_file="$OUT/examples.txt"
+          [[ -f "$source_file" ]] || die "neither $OUT/rollouts.jsonl nor $OUT/examples.txt exists"
+          "$PY" -m chat_vpa.inspect_rollouts "$source_file" ;;
+  *)      die "usage: rollout_throughput.sh [launch|run|show|inspect]" ;;
 esac

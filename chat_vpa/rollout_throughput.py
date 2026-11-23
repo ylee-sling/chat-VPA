@@ -8,7 +8,8 @@ rollout_throughput.py -- how many autoregressive rollouts are affordable (the te
 
 E0's rollout arm needs one rollout of the frozen backbone per training prompt (``rollouts.py``). This measures,
 on the first ``--num-prompts`` training examples in ``CorpusStream`` order (both prompt formats as drawn, the
-stream of the predecessor's ``runs/stage0-a``), for each batch size in turn:
+stream of the predecessor's ``runs/stage0-a``; with ``--kind`` the first examples of that format only, and the
+number of stream examples read to find them is recorded), for each batch size in turn:
 
     wall time, rollouts and generated tokens per second, peak memory
     how rows ended: the truncation rule, <eos>, the budget (dropped) or a program too long for the canvas
@@ -21,9 +22,12 @@ rollouts, and measures on its kept rollouts what Corollary 1 asks for: the entro
 along each rollout (``rollouts.teacher_forced_stats``), next to the backbone's negative log-likelihood at
 temperature 1 of the rollouts and of the human references of the same prompts.
 
-Writes ``OUT/throughput.json`` and ``OUT/examples.txt`` (the first 20 prompts with their reference and their
-rollout) and nothing else: no rollout is stored for training and no generated code is executed.
-``--show OUT`` prints the summary of a finished measurement.
+Writes ``OUT/throughput.json`` (after every batch size, so that a later failure keeps what was measured),
+``OUT/examples.txt`` (the first ``--examples`` prompts with their reference and their rollout) and
+``OUT/rollouts.jsonl`` (every rollout of the fastest batch size: prompt, reference, the truncated program and how
+it stopped; for ``inspect_rollouts.py``), the last two before the teacher-forced pass, and nothing else: no
+rollout is stored as a training target and no generated code is executed. ``--show OUT`` prints the summary of
+a finished measurement.
 """
 
 from __future__ import annotations
@@ -137,12 +141,23 @@ def _pooled(stats: Sequence[dict[str, float]]) -> dict[str, float]:
             "eos_nll": round(sum(s["eos_nll"] for s in stats) / programs, 5)}
 
 
+def _kind_note(result: dict[str, Any]) -> str:
+    """For a run with ``--kind``: which format, and its share of the stream examples read to find the prompts."""
+    kind = result["settings"].get("kind", "both")              # files of earlier runs have no such key
+    if kind == "both":
+        return ""
+    count, read = result["prompts"]["count"], result["prompts"].get("stream_examples_read", 0)
+    share = f" ({100 * count / read:.1f}%)" if read else ""
+    return f"; only '{kind}' prompts: the first {count} of {read} stream examples{share}"
+
+
 def summary_text(result: dict[str, Any]) -> str:
     """The measurement in a few lines (what ``--show`` prints)."""
     s = result["settings"]
     lines = [f"rollout throughput: {result['prompts']['count']} prompts ({result['prompts']['kinds']}), "
              f"{result['device']}, budget {s['max_new_tokens']}, T {s['temperature']}, top-k {s['top_k']}, "
-             f"top-p {s['top_p']}, sorted by prompt length: {s['sorted_by_prompt_length']}",
+             f"top-p {s['top_p']}, sorted by prompt length: {s['sorted_by_prompt_length']}"
+             + _kind_note(result),
              "batch  wall_s  rollouts/s  tokens/s  peak_GiB  kept    trunc   eos     budget  too_long  "
              "prog_tokens(mean/median)"]
     for e in result["batch_sizes"]:
@@ -178,6 +193,35 @@ def summary_text(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def take_examples(stream: CorpusStream, count: int, kind: str | None, patience: int = 200
+                  ) -> tuple[list[Example], int]:
+    """The next ``count`` examples of ``stream``, or of one format only; and how many examples were read."""
+    if kind is None:
+        return stream.take(count), count
+    out: list[Example] = []
+    read = 0
+    while len(out) < count:
+        if read >= patience * max(count, 1):
+            raise SystemExit(f"fewer than {count} '{kind}' examples among the first {read} of the stream")
+        example = stream.take(1)[0]
+        read += 1
+        if example.kind == kind:
+            out.append(example)
+    return out, read
+
+
+def write_rollouts(path: Path, examples: Sequence[Example], rollouts: Sequence[Rollout], tokenizer: HFTokenizer
+                   ) -> None:
+    """One JSON line per rollout, in the examples' order (the keys ``inspect_rollouts.py`` reads)."""
+    with open(path, "w", encoding="utf-8") as handle:
+        for index, (example, rollout) in enumerate(zip(examples, rollouts, strict=True)):
+            handle.write(json.dumps({"index": index, "kind": example.kind, "stop": rollout.stop,
+                                     "generated": rollout.generated, "kept": rollout.kept,
+                                     "prompt": tokenizer.decode(example.prompt_ids),
+                                     "reference": tokenizer.decode(example.canvas_ids),
+                                     "text": rollout.text}) + "\n")
+
+
 def _examples_text(examples: Sequence[Example], rollouts: Sequence[Rollout], tokenizer: HFTokenizer,
                    count: int) -> str:
     parts = []
@@ -203,6 +247,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--canvas-len", type=int, default=256)
     p.add_argument("--max-prompt-tokens", type=int, default=512)
     p.add_argument("--write-fraction", type=float, default=0.5)
+    p.add_argument("--kind", choices=("complete", "write"), default=None,
+                   help="only prompts of this format: the first ones of the stream (a diagnostic)")
     p.add_argument("--stream-seed", type=int, default=0, help="CorpusStream seed (runs/stage0-a: 0)")
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--top-p", type=float, default=0.95)
@@ -229,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     model.to(device)
     stream = CorpusStream(args.corpus, tokenizer, args.canvas_len, args.max_prompt_tokens, args.write_fraction,
                           args.stream_seed)
-    examples = stream.take(args.num_prompts)
+    examples, read = take_examples(stream, args.num_prompts, args.kind)
     order = list(range(len(examples)))
     if not args.no_sort:
         order.sort(key=lambda i: len(examples[i].prompt_ids))        # stable: ties keep the stream's order
@@ -244,11 +290,13 @@ def main(argv: list[str] | None = None) -> int:
                      "temperature": args.temperature, "top_k": args.top_k, "top_p": args.top_p,
                      "canvas_len": args.canvas_len, "max_prompt_tokens": args.max_prompt_tokens,
                      "write_fraction": args.write_fraction, "stream_seed": args.stream_seed, "seed": args.seed,
-                     "check_every": args.check_every, "sorted_by_prompt_length": not args.no_sort},
+                     "check_every": args.check_every, "sorted_by_prompt_length": not args.no_sort,
+                     "kind": args.kind or "both"},
         "prompts": {"count": len(examples), "kinds": dict(sorted(kinds.items())),
                     "prompt_tokens": _quantiles([len(ex.prompt_ids) for ex in examples]),
                     "reference_program_tokens": _quantiles([len(ex.canvas_ids) - 1 for ex in examples]),
-                    "stream_dropped": dict(stream.dropped), "stream_rows_read": stream.rows_read},
+                    "stream_dropped": dict(stream.dropped), "stream_rows_read": stream.rows_read,
+                    "stream_examples_read": read},
         "batch_sizes": [],
     }
     args.out.mkdir(parents=True, exist_ok=True)
@@ -270,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
             break
         measured[batch_size] = rollouts
         result["batch_sizes"].append(entry)
+        (args.out / "throughput.json").write_text(json.dumps(result, indent=2))
         print(f"   {entry['wall_seconds']} s, {entry['rollouts_per_second']} rollouts/s, kept share "
               f"{entry['kept_share']}", file=sys.stderr, flush=True)
 
@@ -282,6 +331,9 @@ def main(argv: list[str] | None = None) -> int:
                       "kept_share": best["kept_share"], "stops_by_kind": best["stops_by_kind"],
                       "projected": projection(best)}
     rollouts = measured[best["batch_size"]]
+    (args.out / "throughput.json").write_text(json.dumps(result, indent=2))
+    (args.out / "examples.txt").write_text(_examples_text(examples, rollouts, tokenizer, args.examples))
+    write_rollouts(args.out / "rollouts.jsonl", examples, rollouts, tokenizer)
 
     # Corollary 1: the entropy of the decoding distribution along the kept rollouts; the backbone's NLL of the
     # rollouts and of the human references of the same prompts.
@@ -310,7 +362,6 @@ def main(argv: list[str] | None = None) -> int:
                "proxy, their own entropy is unknown",
         "rollouts": _pooled(of_rollouts), "references": references}
     (args.out / "throughput.json").write_text(json.dumps(result, indent=2))
-    (args.out / "examples.txt").write_text(_examples_text(examples, rollouts, tokenizer, args.examples))
     print(summary_text(result), flush=True)
     return 0
 
