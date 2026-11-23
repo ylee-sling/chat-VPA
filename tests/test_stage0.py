@@ -1,0 +1,1129 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 SLING AI Inc.
+"""The imported Stage 0 code (text-VPA's ``tests/test_stage0.py``): the backbone wrapper against transformers'
+own Gemma 4 implementation, the attention masks against explicit loops, the sampler against the paper's jump
+kernel, data, truncation, training and the H2 report. All on a tiny random Gemma 4 text model; nothing is
+downloaded."""
+
+from __future__ import annotations
+
+import copy
+import gzip
+import json
+import math
+import random
+
+import numpy as np
+import pytest
+import torch
+
+transformers = pytest.importorskip("transformers")
+if not hasattr(transformers, "Gemma4ForCausalLM"):                    # pragma: no cover
+    pytest.skip("this transformers release has no Gemma 4", allow_module_level=True)
+
+from chat_vpa import data as s0data  # noqa: E402
+from chat_vpa.autoregressive import cut_at_eos, generate_autoregressive  # noqa: E402
+from chat_vpa.backbone import (  # noqa: E402
+    RealizerSpec,
+    Stage0Realizer,
+    canvas_masks,
+    left_pad,
+    prefill_masks,
+)
+from chat_vpa.canvas_sampler import SamplerConfig, draw_tokens, realize, reveal_counts  # noqa: E402
+from chat_vpa.evaluate import realizer_samples, reference_text, score  # noqa: E402
+from chat_vpa.evaluation.tasks import EvalTask  # noqa: E402
+from chat_vpa.flow import KappaSchedule, kernel_distribution, tilted_jump_kernel  # noqa: E402
+from chat_vpa.postprocess import (  # noqa: E402
+    build_sample,
+    extract_fenced,
+    is_complete,
+    parses,
+    truncate_complete,
+    truncate_write,
+)
+from chat_vpa.report import bootstrap_ratio, h2_verdict  # noqa: E402
+from chat_vpa.train import Stage0Config, Stage0Trainer, learning_rate  # noqa: E402
+
+VOCAB, WINDOW, MASK = 320, 6, 4
+LAYER_TYPES = ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention",
+               "sliding_attention", "full_attention", "full_attention"]
+
+
+def tiny_backbone(seed: int = 0):
+    """A 7-block Gemma 4 text model with every feature of E2B that matters here: local and global blocks with
+    different head sizes, a 6-token window, per-layer embeddings, KV sharing in the upper 3 blocks (which are
+    double-wide), and the final logit soft cap."""
+    torch.manual_seed(seed)
+    cfg = transformers.Gemma4TextConfig(
+        vocab_size=VOCAB, hidden_size=64, intermediate_size=128, num_hidden_layers=7, num_attention_heads=4,
+        num_key_value_heads=1, head_dim=16, global_head_dim=32, sliding_window=WINDOW, layer_types=list(LAYER_TYPES),
+        final_logit_softcapping=30.0, vocab_size_per_layer_input=VOCAB, hidden_size_per_layer_input=8,
+        num_kv_shared_layers=3, use_double_wide_mlp=True, max_position_embeddings=512)
+    return transformers.Gemma4ForCausalLM(cfg).eval()
+
+
+def tiny_realizer(seed: int = 0, **spec):
+    model = tiny_backbone(seed)
+    reference = copy.deepcopy(model)
+    realizer = Stage0Realizer.from_pretrained_model(model, RealizerSpec(mask_id=MASK, lora_rank=4, lora_alpha=4.0,
+                                                                        time_dim=32, **spec))
+    return realizer, reference
+
+
+def randomize_adapters(realizer: Stage0Realizer, scale: float = 0.05) -> None:
+    with torch.no_grad():
+        for name, p in realizer.named_parameters():
+            if p.requires_grad and ("lora_b" in name or "mod_" in name):
+                p.normal_(0.0, scale)
+
+
+class CharTokenizer:
+    """Characters as tokens: ids 0-4 are <pad>, <eos>, <bos>, <unk>, <mask>; a printable character c is
+    ord(c) - 32 + 6 and the newline is 5."""
+
+    bos_id, eos_id, pad_id, mask_id, vocab_size = 2, 1, 0, MASK, VOCAB
+
+    def encode_batch(self, texts):
+        return [[5 if c == "\n" else min(ord(c), 126) - 32 + 6 for c in text] for text in texts]
+
+    def decode(self, ids):
+        return "".join("\n" if i == 5 else chr(i - 6 + 32) for i in ids if i >= 5)
+
+
+# =============================================================================================
+# The backbone wrapper
+# =============================================================================================
+def test_causal_canvas_reproduces_the_backbone():
+    """Prefill + one canvas pass with the backbone's masks = transformers' own forward pass (adapters at their
+    initial values), for prefixes of different lengths in one left-padded batch."""
+    realizer, reference = tiny_realizer()
+    ids = torch.randint(5, VOCAB, (2, 24))
+    starts, prefix_len = [0, 4], 11                                   # row 1 drops its first 4 tokens
+    rows = [ids[b, starts[b]:prefix_len].tolist() for b in range(2)]
+    canvas = ids[:, prefix_len:]
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad(rows, 0))
+        hidden = realizer.canvas_hidden(cache, canvas, torch.zeros_like(canvas, dtype=torch.bool),
+                                        torch.zeros(2), torch.ones(2), mode="causal")
+        got = realizer.logits(hidden)
+        for b in range(2):
+            want = reference(ids[b:b + 1, starts[b]:]).logits[0, prefix_len - starts[b]:]
+            torch.testing.assert_close(got[b], want, rtol=1e-4, atol=1e-5)
+    assert realizer.passes == {"prefill": 1, "canvas": 1}
+
+
+def _loop_masks(prefix_len: int, canvas_len: int, window: int, mode: str) -> dict[str, torch.Tensor]:
+    """The realizer's attention pattern over [prefix; canvas], written out position by position."""
+    total = prefix_len + canvas_len
+    full = torch.zeros(total, total, dtype=torch.bool)
+    sliding = torch.zeros(total, total, dtype=torch.bool)
+    for q in range(total):
+        for k in range(total):
+            if q < prefix_len:                                        # a prompt row: the backbone, causal
+                see = k <= q
+            elif k < prefix_len:                                      # canvas row, prompt key
+                see = True
+            else:                                                     # canvas row, canvas key
+                see = True if mode == "bidirectional" else k <= q
+            full[q, k] = see
+            sliding[q, k] = see and abs(q - k) < window
+    return {"full_attention": full[None, None], "sliding_attention": sliding[None, None]}
+
+
+@pytest.mark.parametrize("mode", ["bidirectional", "causal"])
+def test_canvas_pass_matches_a_single_masked_forward(mode):
+    """The two-pass computation (cached prompt + canvas) equals one forward pass of the unmodified model over
+    [prompt; canvas] under the explicit mask; and under that mask the prompt rows are the causal backbone's."""
+    realizer, reference = tiny_realizer()
+    prefix_len, canvas_len = 10, 14                                   # both longer than the 6-token window
+    ids = torch.randint(5, VOCAB, (1, prefix_len + canvas_len))
+    masks = _loop_masks(prefix_len, canvas_len, WINDOW, mode)
+    with torch.no_grad():
+        want = reference(ids, attention_mask=masks).logits
+        cache = realizer.prefill(*left_pad([ids[0, :prefix_len].tolist()], 0))
+        canvas = ids[:, prefix_len:]
+        hidden = realizer.canvas_hidden(cache, canvas, torch.zeros_like(canvas, dtype=torch.bool),
+                                        torch.zeros(1), torch.ones(1), mode=mode)
+        torch.testing.assert_close(realizer.logits(hidden), want[:, prefix_len:], rtol=1e-4, atol=1e-5)
+        causal = reference(ids).logits
+    torch.testing.assert_close(want[:, :prefix_len], causal[:, :prefix_len], rtol=1e-4, atol=1e-5)
+    if mode == "bidirectional":
+        assert not torch.allclose(want[:, prefix_len:-1], causal[:, prefix_len:-1], atol=1e-3)
+
+
+def test_mask_builders_against_loops():
+    prefix_len, canvas_len = 9, 11
+    pos, valid = torch.arange(prefix_len)[None], torch.ones(1, prefix_len, dtype=torch.bool)
+    canvas_pos = prefix_len + torch.arange(canvas_len)[None]
+    for mode in ("bidirectional", "causal"):
+        want = _loop_masks(prefix_len, canvas_len, WINDOW, mode)
+        got_prefix = prefill_masks(pos, valid, WINDOW)
+        got_canvas = canvas_masks(pos, valid, canvas_pos, WINDOW, mode)
+        for kind in ("full_attention", "sliding_attention"):
+            assert torch.equal(got_prefix[kind], want[kind][:, :, :prefix_len, :prefix_len])
+            assert torch.equal(got_canvas[kind], want[kind][:, :, prefix_len:, :])
+    # Left padding: padded keys are invisible, a padded query sees only itself, and distances use positions.
+    ids, valid, pos = left_pad([[7, 8, 9], [7]], 0)
+    masks = prefill_masks(pos, valid, window=2)
+    assert masks["full_attention"][1, 0].tolist() == [[True, False, False], [False, True, False],
+                                                      [False, False, True]]
+    assert masks["sliding_attention"][0, 0].tolist() == [[True, False, False], [True, True, False],
+                                                         [False, True, True]]
+    assert ids.tolist() == [[7, 8, 9], [0, 0, 7]] and pos.tolist() == [[0, 1, 2], [0, 0, 0]]
+
+
+def test_adapters_start_as_the_identity_and_never_touch_the_prompt():
+    realizer, _ = tiny_realizer()
+    ids = torch.randint(5, VOCAB, (2, 20))
+    canvas, nothing = ids[:, 8:], torch.zeros(2, 12, dtype=torch.bool)
+    t, h = torch.tensor([0.25, 0.5]), torch.tensor([0.125, 0.5])
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad([r.tolist() for r in ids[:, :8]], 0))
+        on = realizer.canvas_hidden(cache, canvas, nothing, t, h, adapters=True)
+        off = realizer.canvas_hidden(cache, canvas, nothing, t, h, adapters=False)
+        torch.testing.assert_close(on, off, rtol=0, atol=0)          # LoRA B = 0, modulation = 0
+        assert float(realizer.modulation(t, h).abs().max()) == 0.0
+        randomize_adapters(realizer)
+        changed = realizer.canvas_hidden(cache, canvas, nothing, t, h)
+        assert float((changed - off).abs().max()) > 1e-3
+        again = realizer.prefill(*left_pad([r.tolist() for r in ids[:, :8]], 0))
+        for layer, keys in cache.keys.items():                       # one prompt cache for every role
+            torch.testing.assert_close(again.keys[layer], keys, rtol=0, atol=0)
+            torch.testing.assert_close(again.values[layer], cache.values[layer], rtol=0, atol=0)
+        other_h = realizer.canvas_hidden(cache, canvas, nothing, t, torch.tensor([0.5, 0.125]))
+        assert float((other_h - changed).abs().max()) > 1e-4         # the step size reaches the network
+    assert sorted(cache.keys) == [0, 1, 2, 3]                        # only the KV-storing blocks ran
+    frozen = [n for n, p in realizer.named_parameters() if not p.requires_grad]
+    assert frozen and all("lora_" not in n for n in frozen)
+    trainable = {n for n, p in realizer.named_parameters() if p.requires_grad}
+    assert all(("lora_" in n) or n.startswith(("mask_embedding", "t_mlp", "h_mlp", "mod_")) for n in trainable)
+
+
+def test_mask_positions_use_the_mask_embedding_and_ignore_their_ids():
+    realizer, _ = tiny_realizer()
+    torch.testing.assert_close(realizer.mask_embedding.detach(),
+                               realizer.text.embed_tokens(torch.tensor([MASK]))[0].detach())
+    ids = torch.randint(5, VOCAB, (1, 16))
+    canvas = ids[:, 6:].clone()
+    is_mask = torch.zeros(1, 10, dtype=torch.bool)
+    is_mask[0, [2, 3, 7]] = True
+    t, h = torch.zeros(1), torch.ones(1)
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad([ids[0, :6].tolist()], 0))
+        first = realizer.canvas_hidden(cache, canvas, is_mask, t, h)
+        canvas[0, [2, 3, 7]] = torch.tensor([9, 10, 11])
+        second = realizer.canvas_hidden(cache, canvas, is_mask, t, h)
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        explicit = canvas.clone()
+        explicit[0, [2, 3, 7]] = MASK                                 # the <mask> token itself: same at init
+        third = realizer.canvas_hidden(cache, explicit, torch.zeros_like(is_mask), t, h)
+        torch.testing.assert_close(first, third, rtol=1e-5, atol=1e-6)
+        with pytest.raises(ValueError, match="anchor"):
+            realizer.canvas_hidden(cache, canvas, torch.ones_like(is_mask), t, h)
+
+
+def test_activation_checkpointing_gives_the_same_gradients():
+    realizer, _ = tiny_realizer()
+    randomize_adapters(realizer)
+    ids = torch.randint(5, VOCAB, (2, 18))
+    canvas = ids[:, 7:]
+    is_mask = torch.zeros(2, 11, dtype=torch.bool)
+    is_mask[:, 3:9] = True
+    t, h = torch.tensor([0.0, 0.5]), torch.tensor([0.25, 0.5])
+    cache = realizer.prefill(*left_pad([r.tolist() for r in ids[:, :7]], 0))
+    targets = torch.randint(5, VOCAB, (2, 11))
+    grads = []
+    for checkpointing in (False, True):
+        realizer.zero_grad()
+        hidden = realizer.canvas_hidden(cache, canvas, is_mask, t, h, checkpointing=checkpointing)
+        loss, _ = realizer.weighted_nll(hidden[is_mask], targets[is_mask], torch.ones(int(is_mask.sum())), chunk=5)
+        loss.backward()
+        grads.append({n: p.grad.clone() for n, p in realizer.named_parameters() if p.requires_grad})
+    assert set(grads[0]) == set(grads[1]) and len(grads[0]) > 40
+    for name, grad in grads[0].items():
+        torch.testing.assert_close(grads[1][name], grad, rtol=1e-4, atol=1e-6, msg=name)
+    stored = [n for n in grads[0] if ".3.self_attn.k_proj.lora_b" in n or ".2.self_attn.v_proj.lora_b" in n]
+    assert len(stored) == 2 and all(float(grads[0][n].abs().sum()) > 0 for n in stored)   # shared K/V carry grads
+
+
+def test_weighted_nll_matches_a_direct_computation():
+    realizer, _ = tiny_realizer()
+    hidden = torch.randn(13, 64, requires_grad=True)
+    targets = torch.randint(0, VOCAB, (13,))
+    weights = torch.rand(13)
+    total, hits = realizer.weighted_nll(hidden, targets, weights, chunk=4)
+    logits = realizer.lm_head(hidden.detach().double().float()).double()
+    logits = 30.0 * torch.tanh(logits / 30.0)                        # the final soft cap
+    logp = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    want = -(weights.double() * logp[torch.arange(13), targets]).sum()
+    assert math.isclose(float(total.detach()), float(want), rel_tol=1e-5)
+    assert int(hits) == int((logits.argmax(-1) == targets).sum())
+    total.backward()
+    assert hidden.grad is not None and float(hidden.grad.abs().sum()) > 0
+
+
+def test_checkpoint_state_round_trip():
+    realizer, _ = tiny_realizer()
+    randomize_adapters(realizer)
+    state = realizer.trainable_state()
+    other, _ = tiny_realizer()
+    other.load_trainable_state(state)
+    for (name, a), (_, b) in zip(sorted(realizer.trainable_state().items()), sorted(other.trainable_state().items()),
+                                 strict=True):
+        torch.testing.assert_close(a, b, msg=name)
+    assert all(".base." not in name and "embed_tokens" not in name for name in state)
+    with pytest.raises(ValueError, match="disagree"):
+        other.load_trainable_state({k: v for k, v in state.items() if "mask_embedding" not in k})
+
+
+# =============================================================================================
+# The sampler
+# =============================================================================================
+def test_draw_tokens_is_temperature_top_k_then_nucleus():
+    logits = torch.log(torch.tensor([[0.5, 0.2, 0.15, 0.1, 0.05]]))
+    # Reference: T = 1; top-4 keeps {0, 1, 2, 3} -> 0.5/.95 ...; nucleus 0.8 keeps the smallest prefix of mass
+    # >= 0.8: {0, 1, 2} (0.526 + 0.211 + 0.158 = 0.895), renormalised.
+    kept = np.array([0.5, 0.2, 0.15]) / 0.85
+    generator = torch.Generator().manual_seed(0)
+    draws, probs = draw_tokens(logits.expand(40_000, -1), 1.0, 0.8, 4, generator=generator)
+    freq = np.bincount(draws.numpy(), minlength=5) / 40_000
+    assert freq[3] == 0 and freq[4] == 0
+    assert np.all(np.abs(freq[:3] - kept) < 5 * np.sqrt(kept * (1 - kept) / 40_000))
+    posterior = torch.tensor([0.5, 0.2, 0.15, 0.1, 0.05])           # the reported probability is the posterior's
+    torch.testing.assert_close(probs, posterior[draws], rtol=1e-5, atol=1e-6)
+    greedy, confidence = draw_tokens(logits, 0.0, 0.8, 4, forbidden=[0])
+    assert greedy.tolist() == [1] and math.isclose(float(confidence), 0.2 / 0.5, rel_tol=1e-5)
+    sharp, confidence = draw_tokens(logits.expand(64, -1), 0.01, 1.0, 5, generator=generator)
+    assert sharp.tolist() == [0] * 64 and bool((confidence - 0.5).abs().max() < 1e-5)
+
+
+def test_reveal_counts():
+    masked = torch.tensor([10, 3, 0, 1])
+    assert reveal_counts(masked, 0.25, last=False).tolist() == [2, 1, 0, 1]
+    assert reveal_counts(masked, 0.25, last=True).tolist() == [10, 3, 0, 1]
+
+
+def test_one_step_is_the_exact_jump_kernel_on_the_mask_source():
+    """With the mask source and no energies, Eq. 17's kernel is: stay at [MASK] with probability 1 - pi, else
+    draw from the posterior restricted to V minus [MASK]. Checked by Monte Carlo against ``kernel_distribution``
+    for the first step of K = 4 (cosine): 5 standard errors."""
+    realizer, _ = tiny_realizer()
+    randomize_adapters(realizer)
+    cfg = SamplerConfig(num_steps=4, schedule="cosine", temperature=1.0, top_p=1.0, top_k=VOCAB)
+    prefix = [2, 40, 41, 42, 43]
+    rows, canvas_len = 4000, 3
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad([prefix], 0))
+        anchor = torch.full((1,), 44)
+        tokens = torch.full((1, canvas_len), MASK)
+        hidden = realizer.canvas_hidden(cache, torch.cat([anchor[:, None], tokens], 1),
+                                        torch.tensor([[False, True, True, True]]), torch.zeros(1),
+                                        torch.full((1,), 0.25))[:, :canvas_len]
+        logits = realizer.logits(hidden)[0].double()
+        logits[:, MASK] = -math.inf
+        posterior = torch.softmax(logits, dim=-1)                                    # [N, S]
+        pi = KappaSchedule("cosine").exact_jump_mass(0.0, 0.25)
+        kernel = tilted_jump_kernel(posterior, torch.full((canvas_len,), MASK), pi)
+        want = kernel_distribution(kernel, torch.full((canvas_len,), MASK)).numpy()  # [N, S]
+        # One step of the sampler, many times: run K = 4 but look only at what the first step produced.
+        seen = np.zeros_like(want)
+        original = realizer.canvas_hidden
+        states: list[torch.Tensor] = []
+
+        def spy(cache_, canvas_ids, is_mask, t, h, **kw):
+            states.append(torch.where(is_mask, torch.full_like(canvas_ids, MASK), canvas_ids)[:, 1:].clone())
+            return original(cache_, canvas_ids, is_mask, t, h, **kw)
+
+        realizer.canvas_hidden = spy                                                 # type: ignore[method-assign]
+        result = realize(realizer, cache.expand(rows), anchor.expand(rows), canvas_len, cfg, generator=generator)
+        realizer.canvas_hidden = original                                            # type: ignore[method-assign]
+    after_first = states[1].numpy()                                                  # the state step 2 starts from
+    for j in range(canvas_len):
+        seen[j] = np.bincount(after_first[:, j], minlength=VOCAB) / rows
+    assert math.isclose(float(want[0, MASK]), 1.0 - pi, rel_tol=1e-9)
+    error = 5 * np.sqrt(want * (1 - want) / rows) + 1e-9
+    assert np.all(np.abs(seen - want) <= error)
+    assert result.canvas_passes == 4 and result.sequential_depth == 5
+    assert not bool((result.tokens == MASK).any())
+    assert sum(result.revealed) == rows * canvas_len
+
+
+@pytest.mark.parametrize("order", ["random", "confidence", "left_to_right"])
+def test_realize_reveals_once_and_keeps_revealed_tokens(order):
+    realizer, _ = tiny_realizer()
+    randomize_adapters(realizer)
+    cfg = SamplerConfig(num_steps=8, schedule="cosine", order=order, temperature=0.7)
+    rows, canvas_len = 6, 40
+    states: list[torch.Tensor] = []
+    original = realizer.canvas_hidden
+
+    def spy(cache_, canvas_ids, is_mask, t, h, **kw):
+        assert not bool(is_mask[:, 0].any()) and bool((canvas_ids[:, 0] == 50).all())     # the anchor is clamped
+        states.append(torch.where(is_mask, torch.full_like(canvas_ids, MASK), canvas_ids)[:, 1:].clone())
+        return original(cache_, canvas_ids, is_mask, t, h, **kw)
+
+    realizer.canvas_hidden = spy                                                     # type: ignore[method-assign]
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad([[2, 30, 31]], 0))
+        result = realize(realizer, cache.expand(rows), torch.full((rows,), 50), canvas_len, cfg, forbidden=[0, 2],
+                         generator=torch.Generator().manual_seed(1))
+    assert len(states) == 8 and bool((states[0] == MASK).all())
+    states.append(result.tokens)
+    for before, after in zip(states[:-1], states[1:], strict=True):
+        kept = before != MASK
+        assert torch.equal(after[kept], before[kept])                 # revealed positions never change
+    assert not bool(torch.isin(result.tokens, torch.tensor([MASK, 0, 2])).any())
+    if order == "left_to_right":                                      # revealed positions are always a prefix
+        for state in states:
+            masked = (state == MASK).long()
+            assert bool((masked[:, 1:] >= masked[:, :-1]).all())
+    if order in ("confidence", "left_to_right"):                      # round(pi * masked) per row, cosine kappa
+        kappa = [1 - math.cos(math.pi * k / 16) for k in range(9)]
+        masked = canvas_len
+        for k in range(8):
+            count = masked if k == 7 else max(1, round(masked * (kappa[k + 1] - kappa[k]) / (1 - kappa[k])))
+            assert result.revealed[k] == rows * count
+            masked -= count
+
+
+class ScriptedRealizer:
+    """A stand-in for ``Stage0Realizer`` whose posterior at canvas position j is (almost) all on ``script[j]``,
+    so what the sampler reveals, and when, can be checked exactly."""
+
+    def __init__(self, script: list[int], vocab: int = 40) -> None:
+        import types
+
+        self.spec = types.SimpleNamespace(mask_id=MASK)
+        self.passes = {"prefill": 0, "canvas": 0}
+        self.script = torch.tensor(script)
+        self.vocab = vocab
+        self.masks: list[torch.Tensor] = []
+        self.calls: list[tuple[str, bool]] = []
+        self.times: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def canvas_hidden(self, cache, canvas_ids, is_mask, t, h, mode="bidirectional", adapters=True):
+        self.passes["canvas"] += 1
+        self.masks.append(is_mask[:, 1:].clone())
+        self.calls.append((mode, adapters))
+        self.times.append((t.clone(), h.clone()))
+        b, c = canvas_ids.shape
+        hidden = torch.zeros(b, c, self.vocab)
+        hidden[:, : len(self.script)] = torch.nn.functional.one_hot(self.script, self.vocab).float()
+        return hidden                                                 # index j: the posterior of canvas token j
+
+    def logits(self, hidden):
+        return 40.0 * hidden
+
+
+def test_left_to_right_stop_skips_only_passes_that_cannot_change_the_output():
+    stop, n = 1, 16
+    script = [10, 11, 12, 13, 14, stop, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+    cfg = SamplerConfig(num_steps=16, schedule="cosine", order="left_to_right", temperature=0.2)
+    full = ScriptedRealizer(script)
+    whole = realize(full, None, torch.full((3,), 9), n, cfg, generator=torch.Generator().manual_seed(0))
+    early = ScriptedRealizer(script)
+    short = realize(early, None, torch.full((3,), 9), n, cfg, generator=torch.Generator().manual_seed(0),
+                    stop_id=stop)
+    assert whole.tokens[0].tolist() == script and whole.canvas_passes == 16 and whole.row_passes.tolist() == [16] * 3
+    assert torch.equal(short.tokens[:, :6], whole.tokens[:, :6])      # identical up to and including the <eos>
+    assert bool((short.tokens[:, 6:] == stop).all())                  # the rest is filled with it
+    cumulative = torch.tensor(short.revealed).cumsum(0) // 3          # positions revealed per row after each pass
+    assert short.canvas_passes == int((cumulative < 6).sum()) + 1 < 16  # stopped at the pass that revealed it
+    assert short.sequential_depth == short.canvas_passes + 1 and short.row_passes.tolist() == [short.canvas_passes] * 3
+    for mask in early.masks:                                          # always a suffix of masked positions
+        assert bool((mask.long()[:, 1:] >= mask.long()[:, :-1]).all())
+    confident = realize(ScriptedRealizer(script), None, torch.full((3,), 9), n,
+                        SamplerConfig(num_steps=16, schedule="cosine", order="confidence"), stop_id=stop)
+    assert confident.canvas_passes == 16                              # the stop applies to left_to_right only
+    with pytest.raises(ValueError, match="order"):
+        SamplerConfig(order="right_to_left")
+
+
+def test_realizer_samples_reports_the_depth_rows_needed():
+    script = [10, 11, 1] + [20] * 9
+    realizer = ScriptedRealizer(script)
+
+    class Cache:
+        def expand(self, rows):
+            return self
+
+    realizer.prefill = lambda *args: Cache()                          # type: ignore[attr-defined]
+    task, _ = _tasks()
+    texts, info = realizer_samples(realizer, CharTokenizer(), [task], "humaneval",
+                                   SamplerConfig(num_steps=12, schedule="cosine", order="left_to_right"),
+                                   canvas_len=12, num_samples=4, batch_size=4, seed=0, device=torch.device("cpu"))
+    assert texts == [[CharTokenizer().decode([10, 11])] * 4]
+    # One token per pass at K = 12, N = 12; the <eos> at position 3 is revealed by the third pass, then the stop.
+    assert info["mean_sequential_depth"] == info["sequential_depth"] == 4
+    assert info["mean_revealed_per_step"] == [1.0, 1.0, 1.0] + [0.0] * 9
+
+
+def test_row_done_stops_a_row_without_changing_its_program():
+    """The truncation rule's stop, found in the revealed prefix, fixes the program: stopping there gives the same
+    program as decoding the whole canvas (``realizer_samples`` with a prefix check every 8 steps)."""
+    tok = CharTokenizer()
+    script = tok.encode_batch(["    return 1\nprint(f(1))\n" + "#" * 6])[0]          # no <eos> anywhere
+    n = len(script)
+    humaneval, _ = _tasks()
+
+    class Cache:
+        def expand(self, rows):
+            return self
+
+    outputs = {}
+    for order in ("left_to_right", "random"):
+        realizer = ScriptedRealizer(script, vocab=VOCAB)
+        realizer.prefill = lambda *args: Cache()                      # type: ignore[attr-defined]
+        texts, info = realizer_samples(realizer, tok, [humaneval], "humaneval",
+                                       SamplerConfig(num_steps=n, schedule="linear", order=order), canvas_len=n,
+                                       num_samples=2, batch_size=2, seed=0, device=torch.device("cpu"))
+        outputs[order] = (texts[0], info, realizer.passes["canvas"])
+    stopped, info, passes = outputs["left_to_right"]
+    full, _, full_passes = outputs["random"]                          # all n steps, the whole canvas revealed
+    assert full_passes == n and passes == 16 < n                      # "p" revealed at step 14, checked at 16
+    assert stopped != full and [build_sample(humaneval, "humaneval", t) for t in stopped] == \
+        [build_sample(humaneval, "humaneval", t) for t in full] == [humaneval.context + "    return 1\n"] * 2
+    assert info["mean_sequential_depth"] == 17.0 and info["canvas_mode"] == "bidirectional" and info["adapters"]
+
+
+def test_backbone_mode_of_the_sampler_is_greedy_generate():
+    """Adapters off, causal masks, one token per step, temperature 0: the realizer's sampler is the backbone's own
+    greedy decoding. The server check of the real model relies on this; here it is transformers' ``generate``."""
+    realizer, reference = tiny_realizer(seed=1)
+    randomize_adapters(realizer)                                      # must not matter: the adapters are off
+    prompt, n = [2, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69], 12
+    reference.generation_config.eos_token_id = 1
+    with torch.no_grad():
+        out = reference.generate(torch.tensor([prompt]), max_new_tokens=n, do_sample=False,
+                                 suppress_tokens=[MASK, 0, 2], pad_token_id=0)
+    want = cut_at_eos(out[0, len(prompt):].tolist(), [1])
+    cfg = SamplerConfig(num_steps=n, schedule="linear", order="left_to_right", temperature=0.0)
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad([prompt[:-1]], 0))
+        result = realize(realizer, cache, torch.tensor([prompt[-1]]), n, cfg, forbidden=[0, 2], mode="causal",
+                         adapters=False, stop_id=1)
+    assert result.revealed[:len(want)] == [1] * len(want)              # one token per step
+    assert cut_at_eos(result.tokens[0].tolist(), [1]) == want and len(want) >= 3
+
+
+def test_matched_time_gives_the_network_a_pair_seen_in_training():
+    from chat_vpa.canvas_sampler import network_time
+
+    schedule = KappaSchedule("cosine")
+    masked = torch.zeros(4, 40, dtype=torch.bool)
+    for row, count in enumerate((40, 31, 12, 1)):                     # revealed fractions 0, 9/40, 28/40, 39/40
+        masked[row, 40 - count:] = True
+    t, h = network_time(SamplerConfig(num_steps=256), schedule, 3 / 256, 1 / 256, masked)
+    assert t.tolist() == [3 / 256] * 4 and h.tolist() == [1 / 256] * 4    # "schedule": Algorithm 1's values
+    t, h = network_time(SamplerConfig(num_steps=256, time_input="matched"), schedule, 3 / 256, 1 / 256, masked)
+    want = []
+    for count in (40, 31, 12, 1):                                     # an independent loop over the grid
+        revealed = 1 - count / 40
+        gaps = [abs((1 - math.cos(math.pi * (j / 8) / 2)) - revealed) for j in range(8)]
+        want.append(gaps.index(min(gaps)) / 8)
+    assert t.tolist() == want and want == [0.0, 0.375, 0.75, 0.875] and h.tolist() == [0.125] * 4
+    realizer = ScriptedRealizer([10, 11, 12, 13, 14, 1, 20, 21])
+    realize(realizer, None, torch.full((2,), 9), 8,
+            SamplerConfig(num_steps=8, schedule="cosine", order="left_to_right", time_input="matched"), stop_id=1)
+    grid = {j / 8 for j in range(8)}
+    assert all(set(t_in.tolist()) <= grid and set(h_in.tolist()) == {0.125} for t_in, h_in in realizer.times)
+    with pytest.raises(ValueError, match="time_input"):
+        SamplerConfig(time_input="interpolated")
+
+
+def test_realizer_samples_passes_the_canvas_mode_and_adapters():
+    realizer = ScriptedRealizer([10, 11, 1] + [20] * 5)
+
+    class Cache:
+        def expand(self, rows):
+            return self
+
+    realizer.prefill = lambda *args: Cache()                          # type: ignore[attr-defined]
+    task, _ = _tasks()
+    _, info = realizer_samples(realizer, CharTokenizer(), [task], "humaneval",
+                               SamplerConfig(num_steps=8, schedule="linear", order="left_to_right"), canvas_len=8,
+                               num_samples=1, batch_size=1, seed=0, device=torch.device("cpu"), mode="causal",
+                               adapters=False)
+    assert set(realizer.calls) == {("causal", False)} and info["canvas_mode"] == "causal" and not info["adapters"]
+    with pytest.raises(ValueError, match="stop_id"):
+        realize(realizer, None, torch.tensor([9]), 8, SamplerConfig(order="left_to_right"),
+                row_done=lambda tokens: torch.zeros(1, dtype=torch.bool))
+
+
+# =============================================================================================
+# Data
+# =============================================================================================
+ROW = {
+    "context": 'import math as m\n\n\ndef area(r: float, *, scale=1) -> float:\n    """Return the area of a circle.\n\n'
+               '    Uses pi.\n    """\n',
+    "target": 'import math as m\n\n\ndef area(r: float, *, scale=1) -> float:\n    """Return the area of a circle.\n\n'
+              '    Uses pi.\n    """\n    # comment\n    return m.pi * r ** 2 * scale\n',
+    "documented": True, "method": False,
+}
+
+
+def test_example_formats():
+    prompt, body = s0data.complete_example(ROW)
+    assert prompt == ROW["context"] and prompt + body == ROW["target"]
+    prompt, code = s0data.write_example(ROW)
+    # The assert names the function and nothing else: with the parameter names in it (the first run), the
+    # realizer learned to copy an MBPP assert's literal arguments into its def line.
+    assert prompt == '"""\nReturn the area of a circle.\n\nUses pi.\nassert area(...) == ...\n"""\n\n'
+    assert "scale" not in prompt and "(r" not in prompt
+    assert code == ("import math as m\n\n\ndef area(r: float, *, scale=1) -> float:\n    # comment\n"
+                    "    return m.pi * r ** 2 * scale\n")
+    compile(code, "<write>", "exec")
+    assert s0data.write_example({**ROW, "method": True}) is None
+    import warnings
+
+    escaped = {**ROW, "target": ROW["target"].replace("return m.pi", 'x = "\\d"\n    return m.pi')}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                                # a SyntaxWarning would raise here
+        assert s0data.write_example(escaped) is not None
+    assert s0data.write_example({**ROW, "documented": False}) is None
+    one_line = 'def f(x):\n    """Doc."""; return x\n'
+    assert s0data.write_example({"context": "", "target": one_line, "documented": True}) is None
+    assert s0data.complete_example({"context": "def f():\n", "target": "def g():\n    pass\n"}) is None
+    assert s0data.mbpp_prompt("Add two numbers.\nassert add(1, 2) == 3") == \
+        '"""\nAdd two numbers.\nassert add(1, 2) == 3\n"""\n\n'      # the blank line: see data.py
+
+
+def test_tokenize_collate_and_training_state():
+    tok = CharTokenizer()
+    pairs = [("def f(x):\n", "    return x\n", "complete"), ("p", "y" * 40, "complete"), ("q" * 30, "z", "complete")]
+    examples, dropped = s0data.tokenize_examples(pairs, tok, canvas_len=20, max_prompt_tokens=16)
+    assert len(examples) == 1 and dropped == {"canvas_too_long": 1, "prompt_too_long": 1, "special_token": 0,
+                                              "invalid_unicode": 0}
+    surrogate = json.loads('"    return \\"\\ud83d\\"\\n"')                    # a lone surrogate, as JSON stores it
+    assert len(surrogate) == 15 and not surrogate.isascii()
+    kept, dropped = s0data.tokenize_examples([pairs[0], ("def g():\n", surrogate, "complete")], tok, 20, 16)
+    assert [e.canvas_ids for e in kept] == [examples[0].canvas_ids] and dropped["invalid_unicode"] == 1
+    ex = examples[0]
+    assert ex.prompt_ids[0] == tok.bos_id and ex.canvas_ids[-1] == tok.eos_id and len(ex.canvas_ids) == 14
+    batch = s0data.collate([ex, ex], 20, tok.eos_id)
+    assert batch.prefix_rows[0] == ex.prompt_ids[:-1] and batch.anchor.tolist() == [5, 5]     # "\n" is the anchor
+    assert batch.length.tolist() == [14, 14] and bool((batch.target[:, 13:] == tok.eos_id).all())
+    schedule = KappaSchedule("cosine")
+    state = s0data.training_state(batch, schedule, [2, 4, 8], MASK, VOCAB, 0.1, torch.Generator().manual_seed(0),
+                                  budget=8, step_index=4)
+    assert state.t.tolist() == [0.5, 0.5] and state.h.tolist() == [0.125, 0.125]
+    assert state.canvas_ids.shape == (2, 21) and not bool(state.is_mask[:, 0].any())
+    masked = state.is_mask[:, 1:]
+    assert torch.equal(state.canvas_ids[:, 1:][~masked], batch.target[~masked])               # revealed = clean
+    want = torch.where(torch.arange(20)[None] < 14, 1.0, 0.1) * masked
+    torch.testing.assert_close(state.weights, want.float())
+    zero = s0data.training_state(batch, schedule, [2, 4, 8], MASK, VOCAB, 0.1, torch.Generator().manual_seed(0),
+                                 budget=2, step_index=0)
+    assert bool(zero.is_mask[:, 1:].all())                           # t = 0: the source, everything masked
+    # Drawn states: K from the budgets, t on K's grid, and the masked fraction follows 1 - kappa_t.
+    big = s0data.collate([ex] * 512, 20, tok.eos_id)
+    drawn = s0data.training_state(big, schedule, [2, 4, 8], MASK, VOCAB, 0.1, torch.Generator().manual_seed(3))
+    budgets = (1.0 / drawn.h).round()
+    assert set(budgets.tolist()) == {2.0, 4.0, 8.0}
+    torch.testing.assert_close(drawn.t * budgets, (drawn.t * budgets).round(), atol=1e-5, rtol=0)
+    expected = (1.0 - schedule.kappa(drawn.t)).mean()
+    observed = drawn.is_mask[:, 1:].float().mean()
+    assert abs(float(observed - expected)) < 5 * 0.5 / math.sqrt(512 * 20)
+
+
+def test_prefix_states_reveal_a_prefix_and_mask_the_rest():
+    tok = CharTokenizer()
+    pairs = [("def f(x):\n", "    return x\n", "complete"), ("def g(y):\n", "    y += 1\n    return y * 2\n", "complete")]
+    examples, _ = s0data.tokenize_examples(pairs, tok, canvas_len=40, max_prompt_tokens=16)
+    batch = s0data.collate(examples, 40, tok.eos_id)
+    lengths = batch.length.tolist()
+    assert lengths == [14, 29]
+    schedule = KappaSchedule("cosine")
+
+    # Pinned L: positions < L are clean, positions >= L are [MASK]; weights 1 on the program and its first
+    # <eos>, pad_weight on the filling, 0 on the revealed prefix; next_only keeps position L alone.
+    pinned = torch.tensor([0, 28])
+    state = s0data.prefix_state(batch, schedule, [2, 4, 8], MASK, 0.1, torch.Generator().manual_seed(0), pinned)
+    assert state.canvas_ids.shape == (2, 41) and state.canvas_ids[:, 0].tolist() == batch.anchor.tolist()
+    for row, (first, length) in enumerate(zip(pinned.tolist(), lengths, strict=True)):
+        for j in range(40):
+            assert bool(state.is_mask[row, j + 1]) == (j >= first)
+            want = 0.0 if j < first else (1.0 if j < length else 0.1)
+            assert math.isclose(float(state.weights[row, j]), want, rel_tol=1e-6)
+            if j < first:
+                assert int(state.canvas_ids[row, j + 1]) == int(batch.target[row, j])
+    assert not bool(state.is_mask[:, 0].any())
+    only = s0data.prefix_state(batch, schedule, [2, 4, 8], MASK, 0.1, torch.Generator().manual_seed(0), pinned,
+                               next_only=True)
+    assert torch.equal(only.is_mask, state.is_mask) and only.weights.sum(dim=1).tolist() == [1.0, 1.0]
+    assert only.weights[0, 0] == 1.0 and only.weights[1, 28] == 1.0
+    for bad in (torch.tensor([14, 0]), torch.tensor([0, -1])):               # the first <eos> is never revealed
+        with pytest.raises(ValueError):
+            s0data.prefix_state(batch, schedule, [8], MASK, 0.1, None, bad)
+
+    # Time input: K from the budgets, t the point of K's grid whose kappa is nearest L / N, h = 1 / K
+    # (reference: an explicit loop in float64).
+    big = s0data.collate([examples[1]] * 600, 40, tok.eos_id)
+    drawn = s0data.prefix_state(big, schedule, [2, 4, 8], MASK, 0.1, torch.Generator().manual_seed(5))
+    first = drawn.is_mask[:, 1:].long().argmax(dim=1)
+    assert bool((drawn.is_mask[:, 1:] == (torch.arange(40)[None] >= first[:, None])).all())
+    budgets = (1.0 / drawn.h).round().long()
+    assert set(budgets.tolist()) == {2, 4, 8}
+    for row in range(0, 600, 7):
+        big_k, fraction = int(budgets[row]), int(first[row]) / 40
+        gaps = [abs(1.0 - math.cos(math.pi * (k / big_k) / 2.0) - fraction) for k in range(big_k)]
+        assert math.isclose(float(drawn.t[row]), gaps.index(min(gaps)) / big_k, abs_tol=1e-6)
+    # L is uniform on 0 .. length - 1 = 0 .. 28: every value occurs, the mean is 14 (5 standard errors).
+    assert sorted(set(first.tolist())) == list(range(29))
+    assert abs(float(first.float().mean()) - 14.0) < 5 * math.sqrt((29**2 - 1) / 12 / 600)
+
+
+def test_prefix_fraction_mixes_the_two_state_families():
+    tok = CharTokenizer()
+    examples, _ = s0data.tokenize_examples([("def g(y):\n", "    y += 1\n    return y * 2\n", "complete")], tok, 40, 16)
+    big = s0data.collate([examples[0]] * 512, 40, tok.eos_id)
+    schedule = KappaSchedule("cosine")
+
+    def draw(**kw):
+        return s0data.training_state(big, schedule, [2, 4, 8], MASK, VOCAB, 0.1, torch.Generator().manual_seed(11), **kw)
+
+    base = draw()
+    zero = draw(prefix_fraction=0.0)
+    for name in ("canvas_ids", "is_mask", "t", "h", "weights"):             # 0 is the first run's recipe, exactly
+        assert torch.equal(getattr(zero, name), getattr(base, name)), name
+    mixed = draw(prefix_fraction=0.5)
+    masks = mixed.is_mask[:, 1:]
+    changed = (masks != base.is_mask[:, 1:]).any(dim=1) | (mixed.t != base.t) | (mixed.h != base.h)
+    # A replaced row is prefix-shaped (its mask never switches off along the canvas) and masks its first <eos>;
+    # an untouched row is the uniform state it would have been without the mixture.
+    assert bool((masks[changed][:, 1:] >= masks[changed][:, :-1]).all()) and bool(masks[changed][:, 28].all())
+    assert torch.equal(mixed.canvas_ids[~changed], base.canvas_ids[~changed])
+    share = float(changed.float().mean())                # a few replaced rows coincide with their uniform state
+    assert 0.5 - 5 * math.sqrt(0.25 / 512) - 0.03 < share < 0.5 + 5 * math.sqrt(0.25 / 512)
+    want = torch.where(torch.arange(40)[None] < 29, 1.0, 0.1) * masks
+    torch.testing.assert_close(mixed.weights, want.float())
+    everything = draw(prefix_fraction=1.0).is_mask[:, 1:]
+    assert bool((everything[:, 1:] >= everything[:, :-1]).all()) and bool(everything[:, 28].all())
+    with pytest.raises(ValueError):
+        draw(prefix_fraction=1.5)
+    # Pinned states (validation, the memory check) never mix.
+    pinned = s0data.training_state(big, schedule, [2, 4, 8], MASK, VOCAB, 0.1, torch.Generator().manual_seed(11),
+                                   budget=8, step_index=4, prefix_fraction=1.0)
+    assert set(pinned.t.tolist()) == {0.5} and not bool((pinned.is_mask[:, 2:] >= pinned.is_mask[:, 1:-1]).all())
+
+
+def _write_corpus(root, functions: int = 60, shards: int = 3) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for i in range(functions):
+        context = f'def f{i}(a, b):\n    """Add {i} to the sum of a and b, twice over."""\n'
+        rows.append({"context": context, "target": context + f"    c = a + b + {i}\n    return c\n",
+                     "documented": True, "method": False})
+    for s in range(shards):
+        with gzip.open(root / f"train-{s:05d}.jsonl.gz", "wt", encoding="utf-8") as handle:
+            for row in rows[s::shards]:
+                handle.write(json.dumps(row) + "\n")
+    with gzip.open(root / "val.jsonl.gz", "wt", encoding="utf-8") as handle:
+        for row in rows[:8]:
+            handle.write(json.dumps(row) + "\n")
+
+
+def test_corpus_stream_is_deterministic_and_resumes_exactly(tmp_path):
+    _write_corpus(tmp_path)
+    tok = CharTokenizer()
+
+    def stream(state=None):
+        return s0data.CorpusStream(tmp_path, tok, 96, 128, write_fraction=0.5, seed=3, chunk_rows=7, state=state)
+
+    first = stream()
+    taken = first.take(150)                                           # more than two epochs of 60
+    assert [e.canvas_ids for e in stream().take(150)] == [e.canvas_ids for e in taken]
+    assert {e.kind for e in taken} == {"complete", "write"}
+    epoch = [tuple(e.prompt_ids) for e in taken[:60]]
+    assert len({tuple(e.prompt_ids + e.canvas_ids) for e in taken[:60]}) == 60 and epoch != sorted(epoch)
+    other = s0data.CorpusStream(tmp_path, tok, 96, 128, write_fraction=0.5, seed=4, chunk_rows=7)
+    assert [e.canvas_ids for e in other.take(60)] != [e.canvas_ids for e in taken[:60]]
+    for cut in (0, 5, 7, 23, 60, 97):
+        head = stream()
+        head.take(cut)
+        resumed = stream(json.loads(json.dumps(head.state())))
+        assert [e.canvas_ids for e in resumed.take(40)] == [e.canvas_ids for e in taken[cut:cut + 40]], cut
+    assert len(s0data.load_validation(tmp_path, tok, 96, 128, limit=6)) == 6
+
+
+# =============================================================================================
+# Truncation and scoring
+# =============================================================================================
+def test_truncation_rules():
+    body = "    x = 1\n\n    return x\n\n\ndef other():\n    pass\n"
+    assert truncate_complete(body) == "    x = 1\n\n    return x\n"
+    assert is_complete(body, "complete") and not is_complete("    x = 1\n    return x\n", "complete")
+    assert truncate_complete("    return 1\nprint(f(2))\n") == "    return 1\n"
+    program = "import re\n\nclass H:\n    pass\n\ndef f(x):\n    return x\n\nassert f(1) == 1\nprint(f(2))\n"
+    assert truncate_write(program) == "import re\n\nclass H:\n    pass\n\ndef f(x):\n    return x\n"
+    assert truncate_write('def f(x):\n    return x\n"""\nNext task\n"""\n') == "def f(x):\n    return x\n"
+    assert not is_complete("def f(x):\n    return x\n", "write")
+    assert extract_fenced("Here:\n```python\ndef f():\n    return 1\n```\nDone.") == "def f():\n    return 1\n"
+    assert extract_fenced("def f():\n    return 1") == "def f():\n    return 1\n"
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                                # a warning would raise here
+        assert parses('import re\nx = re.compile("\\d+")\n') and not parses("def f(:\n")
+
+
+def _tasks() -> tuple[EvalTask, EvalTask]:
+    prompt = 'def add(a, b):\n    """Add two numbers."""\n'
+    humaneval = EvalTask("HE/0", prompt, prompt.rstrip() + "\n\n\n", "\n\nassert add(1, 2) == 3\n",
+                         prompt + "    return a + b\n")
+    mbpp = EvalTask("MBPP/1", "Add two numbers.\nassert add(1, 2) == 3", "", "\n\nassert add(1, 2) == 3\n",
+                    "def add(a, b):\n    return a + b\n")
+    return humaneval, mbpp
+
+
+def test_score_uses_the_same_truncation_for_every_decoder():
+    humaneval, mbpp = _tasks()
+    assert reference_text(humaneval, "humaneval") == "    return a + b\n"
+    texts = [["    return a + b\n\n\ndef junk(:\n", "    return a - b\n"]]
+    summary, rows = score([humaneval], "humaneval", texts, [1, 2], workers=1)
+    assert [r["passed"] for r in rows] == [True, False] and summary["pass@1"] == 0.5 and summary["pass@2"] == 1.0
+    assert summary["parse_rate"] == 1.0 and rows[0]["completion"].endswith("    return a + b\n")
+    summary, rows = score([mbpp], "mbpp", [["def add(a, b):\n    return a + b\nassert add(1, 1) == 3\n",
+                                           "def add(a, b)\n"]], [1], workers=1)
+    assert [r["passed"] for r in rows] == [True, False] and [r["parses"] for r in rows] == [True, False]
+    assert build_sample(mbpp, "mbpp", "```python\ndef add(a, b):\n    return a + b\n```", chat=True) == \
+        "def add(a, b):\n    return a + b\n"
+
+
+def test_realizer_samples_shapes_and_depth():
+    realizer, _ = tiny_realizer()
+    humaneval, mbpp = _tasks()
+    cfg = SamplerConfig(num_steps=4, schedule="cosine")
+    texts, info = realizer_samples(realizer, CharTokenizer(), [humaneval], "humaneval", cfg, canvas_len=12,
+                                   num_samples=5, batch_size=2, seed=0, device=torch.device("cpu"))
+    assert len(texts) == 1 and len(texts[0]) == 5 and all(isinstance(t, str) for t in texts[0])
+    assert info["sequential_depth"] == 5 and math.isclose(sum(info["mean_revealed_per_step"]), 12, abs_tol=0.05)
+    again, _ = realizer_samples(realizer, CharTokenizer(), [humaneval], "humaneval", cfg, canvas_len=12,
+                                num_samples=5, batch_size=2, seed=0, device=torch.device("cpu"))
+    assert again == texts                                             # seeded
+
+
+# =============================================================================================
+# The autoregressive baseline
+# =============================================================================================
+def test_cut_at_eos():
+    assert cut_at_eos([7, 8, 1, 9], [1]) == [7, 8] and cut_at_eos([7, 8], [1, 106]) == [7, 8]
+
+
+def test_greedy_generate_equals_the_backbone_run_through_the_realizer_blocks():
+    """transformers' ``generate`` (the baseline) and the realizer's blocks with causal masks and no adapters are
+    the same network: the greedy continuation is identical token by token."""
+    realizer, reference = tiny_realizer(seed=1)
+    prompt = [2, 60, 61, 62, 63, 64, 65, 66, 67]
+
+    class Tok:
+        eos_token_id, pad_token_id = 1, 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return " ".join(str(i) for i in ids)
+
+    reference.generation_config.eos_token_id = 1
+    texts, lengths = generate_autoregressive(reference, Tok(), prompt, 1, 10, 0.0, 1.0, 50, seed=0)
+    generated = [int(x) for x in texts[0].split()]
+    assert lengths == [len(generated)]
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad([prompt[:-1]], 0))
+        canvas = [prompt[-1]]
+        for _ in range(len(generated)):
+            ids = torch.tensor([canvas])
+            hidden = realizer.canvas_hidden(cache, ids, torch.zeros_like(ids, dtype=torch.bool), torch.zeros(1),
+                                            torch.ones(1), mode="causal", adapters=False)
+            canvas.append(int(realizer.logits(hidden[0, -1]).argmax()))
+    assert canvas[1:] == generated
+
+
+# =============================================================================================
+# Training
+# =============================================================================================
+def test_learning_rate_schedule():
+    cfg = Stage0Config(lr=2e-4, warmup_steps=10, schedule_steps=110, min_lr_fraction=0.1)
+    assert math.isclose(learning_rate(0, cfg), 2e-5) and math.isclose(learning_rate(9, cfg), 2e-4)
+    half = 2e-4 * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * 0.5)))
+    assert math.isclose(learning_rate(60, cfg), half)
+    assert math.isclose(learning_rate(110, cfg), 2e-5) and math.isclose(learning_rate(5000, cfg), 2e-5)
+
+
+def _trainer(tmp_path, run: str, steps: int, **overrides):
+    model = tiny_backbone()
+    realizer = Stage0Realizer.from_pretrained_model(model, RealizerSpec(mask_id=MASK, lora_rank=16, lora_alpha=16.0,
+                                                                        time_dim=32))
+    tok = CharTokenizer()
+    cfg = Stage0Config(canvas_len=48, max_prompt_tokens=96, lora_rank=16, lora_alpha=16.0, lr=1e-2, warmup_steps=5,
+                       steps=steps, schedule_steps=steps, micro_batch=4, grad_accum=2, log_every=1000,
+                       save_every=1000, eval_every=1000, val_examples=8, write_fraction=0.0, **overrides)
+    stream = s0data.CorpusStream(tmp_path / "corpus", tok, cfg.canvas_len, cfg.max_prompt_tokens, cfg.write_fraction,
+                                 cfg.seed, chunk_rows=16)
+    validation = s0data.load_validation(tmp_path / "corpus", tok, cfg.canvas_len, cfg.max_prompt_tokens, 8)
+    return Stage0Trainer(realizer, tok, cfg, stream, validation, tmp_path / run, torch.device("cpu"))
+
+
+def test_training_reduces_the_loss_and_resumes_exactly(tmp_path):
+    _write_corpus(tmp_path / "corpus", functions=16, shards=2)
+    trainer = _trainer(tmp_path, "a", steps=45)
+    report = trainer.fit_memory()
+    assert report["micro_batch"] == 4 and report["grad_checkpoint"] is False
+    backbone_before = {n: p.clone() for n, p in trainer.realizer.named_parameters() if not p.requires_grad}
+    before = trainer.validate()["val_loss"]
+    trainer.realizer.train()
+    for _ in range(12):
+        trainer.train_step()
+    trainer.save()
+    for _ in range(33):
+        last = trainer.train_step()
+    after = trainer.validate()
+    # The tiny model's tied embeddings are small (std 0.02), so its logits stay flat and the loss moves slowly;
+    # the argmax is what shows that the canvas tokens are being learned (chance: 1/320).
+    assert after["val_loss"] < before - 0.3 and after["val_accuracy"] > 0.4 and math.isfinite(last["loss"])
+    for name, p in trainer.realizer.named_parameters():
+        if not p.requires_grad:
+            assert torch.equal(p, backbone_before[name]), name       # the released weights never change
+
+    resumed = _trainer(tmp_path, "b", steps=45)
+    payload = torch.load(tmp_path / "a" / "last.pt", weights_only=True)
+    resumed.stream = s0data.CorpusStream(tmp_path / "corpus", CharTokenizer(), 48, 96, 0.0, 0, chunk_rows=16,
+                                         state=payload["stream"])
+    resumed.restore(payload)
+    assert resumed.step == 12 and resumed.examples_seen == 12 * 8
+    resumed.realizer.train()
+    for _ in range(33):
+        resumed.train_step()
+    for (name, a), (_, b) in zip(sorted(trainer.realizer.trainable_state().items()),
+                                 sorted(resumed.realizer.trainable_state().items()), strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-7, msg=name)
+
+
+def test_next_token_metric_is_the_backbones_own_loss_and_prefix_training_lowers_the_realizers(tmp_path):
+    _write_corpus(tmp_path / "corpus", functions=16, shards=2)
+    trainer = _trainer(tmp_path, "p", steps=40, prefix_fraction=0.5)
+    before = trainer.validate()
+    assert {"val_loss_prefix", "val_loss_next", "val_loss_next_backbone", "val_accuracy_next"} <= set(before)
+
+    # Reference: transformers' Gemma 4 on <bos> prompt + program[:L], scored on program[L], for the L of each
+    # held-out function (the trainer's fixed draws, repeated here with the same seed).
+    reference = tiny_backbone()                                        # the same weights as the trainer's backbone
+    cfg, tok = trainer.cfg, trainer.tokenizer
+    generator = torch.Generator().manual_seed(2_000)
+    total = 0.0
+    for start in range(0, len(trainer.validation), cfg.micro_batch):
+        chunk = trainer.validation[start:start + cfg.micro_batch]
+        batch = s0data.collate(chunk, cfg.canvas_len, tok.eos_id)
+        state = s0data.prefix_state(batch, trainer.schedule, [8], MASK, cfg.pad_weight, generator, next_only=True)
+        for row, example in enumerate(chunk):
+            first = int(state.weights[row].argmax())
+            assert 0 <= first < len(example.canvas_ids)
+            ids = torch.tensor([example.prompt_ids + example.canvas_ids[:first]])
+            with torch.no_grad():
+                logits = reference(input_ids=ids).logits[0, -1].double()
+            total += float(-torch.log_softmax(logits, dim=-1)[example.canvas_ids[first]])
+    assert math.isclose(before["val_loss_next_backbone"], total / len(trainer.validation), rel_tol=1e-4)
+
+    trainer.realizer.train()
+    for _ in range(40):
+        last = trainer.train_step()
+    after = trainer.validate()
+    assert math.isfinite(last["loss"])
+    assert after["val_loss_next_backbone"] == before["val_loss_next_backbone"]      # frozen: computed once
+    # One token per step is learned from prefix states: the realizer's next-token loss falls well below the
+    # (random) backbone's and below its own before training.
+    assert after["val_loss_next"] < before["val_loss_next"] - 0.3
+    assert after["val_loss_next"] < after["val_loss_next_backbone"] - 0.3
+    assert after["val_loss_prefix"] < before["val_loss_prefix"] - 0.3
+
+
+def test_memory_fallback_switches_on_checkpointing_then_halves_the_micro_batch(tmp_path, monkeypatch):
+    _write_corpus(tmp_path / "corpus", functions=16, shards=2)
+    trainer = _trainer(tmp_path, "m", steps=1)
+    calls: list[tuple[int, bool]] = []
+    real = trainer.loss_on
+
+    def tight(batch, **kw):
+        calls.append((batch.target.shape[0], trainer.cfg.grad_checkpoint))
+        if batch.target.shape[0] > 2:
+            raise torch.OutOfMemoryError("simulated")
+        return real(batch, **kw)
+
+    monkeypatch.setattr(trainer, "loss_on", tight)
+    report = trainer.fit_memory()
+    assert calls == [(4, False), (4, True), (2, True)]
+    assert (report["micro_batch"], report["grad_accum"], report["grad_checkpoint"]) == (2, 4, True)
+    assert len(report["tried"]) == 2
+
+
+# =============================================================================================
+# The report
+# =============================================================================================
+def test_bootstrap_ratio_and_verdict():
+    rng = np.random.default_rng(0)
+    baseline = (rng.random(400) < 0.4).astype(float)
+    realizer = baseline * (rng.random(400) < 0.75)                    # solves 3/4 of what the baseline solves
+    rho, low, high = bootstrap_ratio(realizer, baseline)
+    assert math.isclose(rho, realizer.mean() / baseline.mean()) and low < rho < high
+    assert 0.6 < low and high < 0.9
+    # An independent reference for the interval: a plain loop with another generator.
+    loop_rng = random.Random(1)
+    ratios = []
+    for _ in range(2000):
+        index = [loop_rng.randrange(400) for _ in range(400)]
+        ratios.append(realizer[index].mean() / baseline[index].mean())
+    assert abs(low - np.percentile(ratios, 2.5)) < 0.02 and abs(high - np.percentile(ratios, 97.5)) < 0.02
+    assert math.isnan(bootstrap_ratio(np.zeros(5), np.zeros(5))[0])
+    assert h2_verdict({"humaneval": (0.7, 0.6, 0.8), "mbpp": (0.6, 0.52, 0.7)}) == "clearly holds"
+    assert h2_verdict({"humaneval": (0.7, 0.45, 0.8), "mbpp": (0.6, 0.52, 0.7)}) == "holds"
+    assert h2_verdict({"humaneval": (0.2, 0.1, 0.3), "mbpp": (0.1, 0.05, 0.2)}) == "clearly fails"
+    assert h2_verdict({"humaneval": (0.4, 0.3, 0.55), "mbpp": (0.1, 0.05, 0.2)}) == "fails"
+    assert h2_verdict({"humaneval": (0.6, 0.5, 0.7), "mbpp": (0.3, 0.2, 0.4)}) == "mixed"
+    assert h2_verdict({}).startswith("undecided")
+
+
+# =============================================================================================
+# Failure analysis
+# =============================================================================================
+def _sample(passed=False, raw="def f():\n    return 1\n", parses=True, status="failed", detail=""):
+    return {"task_id": "T", "sample": 0, "passed": passed, "status": status, "parses": parses, "detail": detail,
+            "completion": raw, "raw": raw}
+
+
+def test_failure_outcomes_and_messages():
+    from chat_vpa.analyze import OUTCOMES, classify, repeated_identifiers, summarize_samples, syntax_message
+
+    indent = 'File "<p>", line 2\n    return x\n    ^^^^^^\nIndentationError: expected an indented block after ' \
+             "function definition on line 1"
+    rows = [
+        _sample(passed=True, status="passed"),
+        _sample(raw="   \n"),
+        _sample(parses=False, detail=indent),
+        _sample(parses=False, detail="SyntaxError: '(' was never closed"),
+        _sample(detail="Traceback (most recent call last):\n  File ...\nAssertionError"),
+        _sample(detail="Traceback (most recent call last):\nNameError: name 'x' is not defined"),
+        _sample(status="timeout", detail="timeout"),
+        _sample(detail="TabError: inconsistent use of tabs and spaces in indentation"),   # parses here, not there
+    ]
+    assert [classify(r) for r in rows] == ["passed", "empty", "syntax", "syntax", "wrong", "runtime", "timeout",
+                                           "syntax"]
+    assert syntax_message(rows[2]) == "IndentationError: expected an indented block after function definition"
+    assert syntax_message(rows[3]) == "SyntaxError: '(' was never closed"
+    assert repeated_identifiers("return return x x (( y") == (2, 7)      # "((" is punctuation, not counted
+    summary = summarize_samples(rows)
+    assert summary["samples"] == 8 and math.isclose(sum(summary[k] for k in OUTCOMES), 1.0)
+    assert summary["syntax"] == 3 / 8 and summary["passed"] == summary["wrong"] == 1 / 8
+    assert summary["top_syntax_errors"][0][1] == 1 and len(summary["top_syntax_errors"]) == 3
+
+
+def test_def_line_check_finds_copied_test_arguments(tmp_path):
+    from chat_vpa import analyze
+
+    tests = {"MBPP/512": "assert count_element_freq((5, 6, (5, 6), 7, (8, 9), 9) ) == {5: 2, 6: 2, 7: 1, 8: 1, 9: 2}",
+             "MBPP/513": "assert add_str((5, 6, 7, 4, 9) , \"FDF\") == [5, 'FDF', 6, 'FDF']",
+             "MBPP/511": "assert find_Min_Sum(12) == 7", "MBPP/367": "assert is_tree_balanced(root) == False",
+             "MBPP/11": "assert remove_Occ(\"hello\",\"l\") == \"heo\""}
+    assert analyze.first_def("import re\n\ndef f(a):  # note\n    pass\ndef g(): pass\n") == "def f(a):"
+    assert analyze.first_def("x = 1\n    def nested(): pass\n") is None
+    assert analyze.assert_arguments(tests["MBPP/513"], "add_str") == '(5,6,7,4,9),"FDF"'
+    assert analyze.assert_arguments(tests["MBPP/513"], "other") is None
+    assert analyze.assert_arguments("assert f( == 3", "f") is None
+
+    def flags(code, task=None):
+        found = analyze.def_line_flags(code, tests.get(task))
+        return {k for k, v in found.items() if v}
+
+    # The first run's samples (MBPP validation and test, 20 Nov 2026).
+    assert flags("def count_element_freq((5, 6, (5, 6), 7, (8, 9), 9)):\n    pass\n", "MBPP/512") == \
+        {"bad_def", "literal", "copied"}
+    assert flags('def add_str((5, 6, 7, 4, 9) , "FDF"):\n    pass\n', "MBPP/513") == {"bad_def", "literal", "copied"}
+    assert flags("def find_Min_Sum(1):\n    return 1\n", "MBPP/511") == {"bad_def", "literal"}
+    assert flags("def add_str((5,6,7):\n    pass\n", "MBPP/513") == {"bad_def", "literal"}    # a garbled copy
+    assert flags("def l,Occ):\n    pass\n", "MBPP/11") == {"bad_def"}
+    assert flags('def remove_Occ(hello="):\n    pass\n', "MBPP/11") == {"bad_def", "literal"}
+    # The baseline's only "copies": the assert's argument is itself a name. Valid, and no literal.
+    assert flags("def is_tree_balanced(root):\n    return False\n", "MBPP/367") == {"copied"}
+    assert flags("def remove_Occ(s, ch):\n    return s\n", "MBPP/11") == set()
+    assert flags("def f(x=0, y: str = 'a') -> int:\n    return x\n") == {"literal"}   # default values count
+    assert flags("x = 1\n") == {"no_def"}
+    assert flags("def f(a,\n      b):\n    return a\n") == set()                    # continued: no flag
+    assert flags("def copied(1):\n    pass\n") == {"bad_def", "literal"}              # no test: never 'copied'
+
+    rows = [{"task_id": "MBPP/512", "completion": "def count_element_freq((5, 6, (5, 6), 7, (8, 9), 9)):\n    pass\n"},
+            {"task_id": "MBPP/511", "completion": "def find_Min_Sum(n):\n    return n\n"},
+            {"task_id": "MBPP/511", "completion": "def find_Min_Sum(1):\n    return n\n"},
+            {"task_id": "MBPP/11", "completion": "print(1)\n"}]
+    summary = analyze.def_line_summary(rows, tests)
+    assert (summary["samples"], summary["no_def"], summary["bad_def"], summary["literal"], summary["copied"]) == \
+        (4, 0.25, 0.5, 0.5, 0.25)
+    assert summary["examples"] == ["MBPP/512: def count_element_freq((5, 6, (5, 6), 7, (8, 9), 9)):",
+                                   "MBPP/511: def find_Min_Sum(1):"]
+    assert analyze.def_line_summary(rows)["copied"] is None
+
+    # The command line: MBPP gets the table, with the copied column only when the asserts are given.
+    mbpp = tmp_path / "mbpp.jsonl"
+    with open(mbpp, "w", encoding="utf-8") as handle:
+        for task, test in tests.items():
+            handle.write(json.dumps({"task_id": int(task.split("/")[1]), "test_list": [test, "assert True"]}) + "\n")
+    assert analyze.load_mbpp_tests(mbpp) == tests
+    for bench in ("mbpp", "humaneval"):
+        (tmp_path / "eval" / bench / "realizer-K8").mkdir(parents=True)
+        with open(tmp_path / "eval" / bench / "realizer-K8" / "samples.jsonl", "w", encoding="utf-8") as handle:
+            handle.writelines(json.dumps({**_sample(raw=r["completion"]), "task_id": r["task_id"]}) + "\n" for r in rows)
+    assert analyze.main(["--eval", str(tmp_path / "eval"), "--mbpp", str(mbpp)]) == 0
+    result = json.loads((tmp_path / "eval" / "analysis.json").read_text())
+    assert result["mbpp"]["realizer-K8"]["def_line"]["copied"] == 0.25
+    assert "def_line" not in result["humaneval"]["realizer-K8"]              # its samples are function bodies
+    text = (tmp_path / "eval" / "analysis.md").read_text()
+    assert "| realizer-K8 | 4 | 25.0% | 50.0% | 50.0% | 25.0% |" in text and text.count("first `def` line") == 1
+    assert analyze.main(["--eval", str(tmp_path / "eval")]) == 0
+    assert "| realizer-K8 | 4 | 25.0% | 50.0% | 50.0% | - |" in (tmp_path / "eval" / "analysis.md").read_text()
+
+
+def test_one_token_per_step_gate(tmp_path):
+    from chat_vpa import report
+    from chat_vpa.report import GATE, gate_verdict
+
+    assert gate_verdict(0.9, 0.82, 1.0) == "clearly passes" and gate_verdict(0.8, 0.6, 1.0) == "passes"
+    assert gate_verdict(0.36, 0.2, 0.49) == "clearly fails" and gate_verdict(0.5, 0.3, 0.7) == "fails"
+    assert gate_verdict(0.6, 0.45, 0.9) == "partial" and gate_verdict(float("nan"), 0.0, 0.0).startswith("undecided")
+
+    # 10 problems, 5 samples each: the code check solves 4 problems outright, the realizer 3 of the same.
+    def write(tag: str, solved: int) -> None:
+        folder = tmp_path / "mbpp" / tag
+        folder.mkdir(parents=True)
+        with open(folder / "samples.jsonl", "w", encoding="utf-8") as handle:
+            for task in range(10):
+                for j in range(5):
+                    handle.write(json.dumps({"task_id": f"MBPP/{task}", "sample": j, "passed": task < solved}) + "\n")
+        (folder / "summary.json").write_text(json.dumps({"pass@1": solved / 10, "problems": 10,
+                                                         "samples_per_problem": 5}))
+
+    write(GATE[1], 4)
+    write(GATE[0], 3)
+    write("ar", 4)
+    write("realizer-K8", 1)
+    assert report.main(["--eval", str(tmp_path), "--no-verdict"]) == 0
+    result = json.loads((tmp_path / "report.json").read_text())
+    gate = result["gate"]["mbpp"]
+    assert math.isclose(gate["rho"], 0.75) and gate["verdict"] == "partial" and gate["low"] <= 0.75 <= gate["high"]
+    text = (tmp_path / "report.md").read_text()
+    assert "## One token per step (gate of direction A)" in text and "rho_1 = 0.750" in text
+    assert "## H2:" not in text and "for reference: no verdict here" in text and "rho = 0.250" in text
+    assert result["verdict"].startswith("not evaluated")
+
+
+def test_analysis_cli_orders_configurations(tmp_path):
+    from chat_vpa import analyze
+
+    for tag, rows in {"realizer-K16": [_sample()], "realizer-K8-confidence": [_sample(passed=True, status="passed")],
+                      "realizer-K8": [_sample(parses=False, detail="SyntaxError: invalid syntax")],
+                      "ar": [_sample(passed=True, status="passed")], "realizer-K2": [_sample(raw="")]}.items():
+        (tmp_path / "mbpp" / tag).mkdir(parents=True)
+        with open(tmp_path / "mbpp" / tag / "samples.jsonl", "w", encoding="utf-8") as handle:
+            handle.writelines(json.dumps(r) + "\n" for r in rows)
+    assert analyze.main(["--eval", str(tmp_path)]) == 0
+    result = json.loads((tmp_path / "analysis.json").read_text())
+    assert list(result["mbpp"]) == ["ar", "realizer-K2", "realizer-K8", "realizer-K8-confidence", "realizer-K16"]
+    assert result["mbpp"]["realizer-K8"]["syntax"] == 1.0 and result["mbpp"]["realizer-K2"]["empty"] == 1.0
+    assert "SyntaxError: invalid syntax (1)" in (tmp_path / "analysis.md").read_text()

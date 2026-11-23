@@ -1,0 +1,34 @@
+# Virtual environments (recreate with requirements*.txt)
+.venv/
+venv/
+
+# Python bytecode and packaging
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Datasets, checkpoints and logs (never commit)
+/data/
+/data[0-9]*/
+datasets/
+*.jsonl.gz
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+runs/
+wandb/
+logs/

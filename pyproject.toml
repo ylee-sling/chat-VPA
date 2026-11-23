@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chat-vpa"
+version = "0.1.0"
+description = "Chat-VPA: semi-autoregressive block discrete flow matching with autoregressive trajectory distillation"
+readme = "README.md"
+license = "GPL-3.0-only"
+authors = [{ name = "Yeonseok Lee", email = "ylee@sling.ai.kr" }]
+requires-python = ">=3.12"
+keywords = ["discrete flow matching", "semi-autoregressive generation", "block diffusion", "knowledge distillation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Minimum versions; requirements.txt pins the exact versions the code was verified with.
+dependencies = [
+    "torch>=2.14",
+    "transformers>=5.21",
+    "tokenizers>=0.23",
+    "numpy>=2.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9", "ruff>=0.17"]
+
+[project.urls]
+Repository = "https://github.com/ylee-sling/chat-VPA"
+Predecessor = "https://github.com/ylee-sling/text-VPA"
+
+[tool.setuptools.packages.find]
+include = ["chat_vpa*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["F", "E9", "B", "PLE", "PLW", "UP", "I"]
+ignore = ["PLW2901"]

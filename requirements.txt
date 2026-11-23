@@ -1,0 +1,6 @@
+# Exact versions chat-VPA is verified with (the NCP server's ~/text-VPA/.venv: Python 3.12, torch 2.14.1+cu130,
+# transformers 5.21.0). For CUDA install the matching torch build first, then this file.
+torch==2.14.1
+transformers==5.21.0
+tokenizers==0.23.3
+numpy==2.5.3

@@ -1,0 +1,41 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the preprint below."
+title: "chat-VPA: reference code of Chat-VPA, semi-autoregressive block discrete flow matching"
+type: software
+authors:
+  - family-names: Lee
+    given-names: Yeonseok
+    email: ylee@sling.ai.kr
+    orcid: "https://orcid.org/0009-0004-6153-0205"
+    affiliation: "SLING AI Inc."
+license: GPL-3.0-only
+repository-code: "https://github.com/ylee-sling/chat-VPA"
+preferred-citation:
+  type: unpublished
+  title: "Chat-VPA: Semi-Autoregressive Block Discrete Flow Matching with Autoregressive Trajectory Distillation"
+  authors:
+    - family-names: Lee
+      given-names: Yeonseok
+      email: ylee@sling.ai.kr
+      orcid: "https://orcid.org/0009-0004-6153-0205"
+      affiliation: "SLING AI Inc."
+  year: 2026
+  notes: "Preprint, SLING AI Inc. Draft of 22 November 2026."
+references:
+  - type: unpublished
+    title: "Text-VPA: Adapting Vision-Predictor-Action to Few-Step Non-Autoregressive Code Generation via Flow Matching"
+    authors:
+      - family-names: Lee
+        given-names: Yeonseok
+    year: 2026
+    notes: "Preprint, SLING AI Inc. Version of 17 November 2026."
+    url: "https://github.com/ylee-sling/text-VPA"
+  - type: generic
+    title: "PR-JEPA: Decoupling Latent Planning from Few-Step Discrete Realization for Non-Autoregressive Generation of Code, Legal Documents, and Control"
+    authors:
+      - family-names: Lee
+        given-names: Yeonseok
+    publisher:
+      name: Zenodo
+    year: 2026
+    doi: "10.5281/zenodo.23498811"
