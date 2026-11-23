@@ -12,9 +12,9 @@ Table 5): do not repeat those statements, and do not edit the preprint unasked.
 **Status: no Chat-VPA model has been trained or measured.** The code on `main` is text-VPA's verified Stage 0
 code (`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the
 Block-DFM core, its tests, the rollout generator and the checks for the L4 exist, and the checks have run (the port
-is exact: `docs/e0.md`, Section 2.4); the trainer and the rollout writer do not exist yet. The author has confirmed
-`docs/e0.md` except C6, the data, which waits for an inspection of the `write` rollouts; nothing is trained and no
-rollout is stored as a training target before C6 is decided.
+is exact: `docs/e0.md`, Section 2.4). The author has confirmed all of `docs/e0.md` (C1 to C12, 23 November 2026);
+it is frozen, and a later change is a deviation recorded in its Section 9. The rollout writer and the E0 trainer
+exist and are tested on the CPU with the tiny model; neither has run on the L4. Nothing has been trained yet.
 
 ## Layout
 
@@ -35,10 +35,12 @@ rollout is stored as a training target before C6 is decided.
 | `chat_vpa/block_data.py` | Sec. 3.3, Eq. 11, Sec. 4.3 | `collate_blocks`, `block_training_state` (per-block K, t, prefix-shaped or independent reveals, seam and filling weights), `right_open` (O_t) |
 | `chat_vpa/block_objective.py` | Eq. 12 | `dfm_loss` (L_DFM); L_Block-KD, L_Boundary, L_Step, L_Plan are not built |
 | `chat_vpa/block_sampler.py` | Algorithm 1, Prop. 3 | `sample_blocks`: fused commit, exact kernel / prefix / confidence orders, early exit, stopping, passes per block (K-bar), the audit |
-| `chat_vpa/block_evaluate.py`, `compare_samples.py` | Sec. 6.2 | Pass@k of the block sampler in `evaluate.py`'s format, the cache spot check; sample-by-sample comparison of two evaluations |
+| `chat_vpa/block_evaluate.py`, `compare_samples.py` | Sec. 6.2 | Pass@k of the block sampler in `evaluate.py`'s format (Stage 0 and E0 checkpoints), the cache spot check; sample-by-sample comparison of two evaluations |
 | `chat_vpa/rollouts.py`, `rollout_throughput.py` | Sec. 4.1, Cor. 1, Sec. 6.2 | batched AR rollouts of the frozen backbone as training targets; the entropy of the decoding distribution along a target; the throughput measurement (`--kind` for one prompt format; writes `rollouts.jsonl`) |
 | `chat_vpa/inspect_rollouts.py` | | how the rollouts of a throughput run ended: for `write` prompts, where the named function ends and what follows it (a diagnostic for C6; changes no rule) |
-| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` (`inspect` runs `inspect_rollouts.py` on its output), `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back) |
+| `chat_vpa/rollout_writer.py` | Sec. 6.2 | E0's data (C6): the validation set and the kept training set, stratified by format, each example with its reference and one rollout; resumable chunks, halving the batch on out-of-memory; the summary of `docs/e0.md` Section 7 (kept shares, stops, lengths, entropy) |
+| `chat_vpa/train_e0.py` | Secs. 3.3, 6.2, Eq. 12 | E0's trainer: text-VPA's Stage 0 loop with `collate_blocks`, `block_training_state` and `dfm_loss` behind its hooks; `RolloutData`, `EpochStream`; held-out L_DFM on both targets; checkpoints of stage `e0` (registers, the data's fingerprint), read by `block_evaluate` |
+| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` (`inspect` runs `inspect_rollouts.py` on its output), `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back), `e0_data.sh` (`check`: batch 128 against 256; then the data), `e0_train.sh` (one run of T16, R16, T32, R32; `STOP_AT=100` for the timing) |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
 | `docs/provenance.md` | | what was imported from text-VPA at `6f97346`, what changed, what was dropped; the corpus |
@@ -141,8 +143,8 @@ ruff check .                            # must pass
 ## Decisions where the paper is silent (do not change silently)
 
 Made while building the Block-DFM core (23 November 2026). Those marked *(E0)* are choices of the first experiment
-as well, listed in `docs/e0.md` with their alternatives; the author confirmed them on 23 November 2026 (C8, C9),
-except the rollout targets, which belong to C6 and are open.
+as well, listed in `docs/e0.md` with their alternatives; the author confirmed them on 23 November 2026 (C6, C8,
+C9).
 
 - **Local blocks inside a window.** Eq. 5 says the sliding window "applies on top of M" and that a window always
   lies inside it. The code keeps the two-sided rule |n(u) - n(v)| < W of the Stage 0 realizer among window rows
@@ -185,7 +187,12 @@ except the rollout targets, which belong to C6 and are open.
   `row_passes` records for each row the passes after which its own block was complete, and K-bar is their mean.
 - **Rollout targets** *(E0)*. The generated text is cut by the truncation rule, tokenised again and followed by
   one `<eos>`; a rollout that reaches the budget without a stop, or whose program does not fit the canvas, is
-  dropped (`rollouts.py`).
+  dropped (`rollouts.py`), and its prompt leaves both arms. No content filter. The kept set is stratified by
+  format at the stream's `write` share (13.5%), each quota filled in stream order; 100,000 kept examples
+  (`rollout_writer.py`, C6).
+- **Order of the training examples** *(E0)*. A seeded permutation of the kept set per epoch, the same for both
+  arms and both block sizes (`train_e0.EpochStream`); with 100,000 kept examples and 10,000 steps of 32 each is
+  seen about 3.2 times.
 - **Checkpoints of an AR-shift model in bfloat16.** A cache built block by block equals the one-pass prefill up
   to rounding (float32: 1e-5 or less, tested; bfloat16: a few units in the last place), so a separate commit
   pass (ablation A10) gives the fused commit's samples in float32 and need not in bfloat16.

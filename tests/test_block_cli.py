@@ -109,8 +109,8 @@ def test_short_blocks_under_the_pass_audit_with_a_cache_check(run):
     assert separate["fused_commit"] is False and separate["pass_audit"] == "passed"
     exited = json.loads((run / "short" / "mbpp" / "block-B4-K4-prefix-exit50" / "summary.json").read_text())
     assert exited["mean_passes_per_block"] == 1.0 and exited["exit_budget"] == 50.0   # every block exits at once
-    with pytest.raises(SystemExit):                                              # not a Stage 0 checkpoint
+    with pytest.raises(SystemExit, match="'stage1' checkpoint"):                # neither Stage 0 nor E0
         path = run / "other.pt"
-        torch.save({"stage": "e0", "spec": {}, "trainable": {}, "config": {}, "step": 0}, path)
+        torch.save({"stage": "stage1", "spec": {}, "trainable": {}, "config": {}, "step": 0}, path)
         block_evaluate.main(["--checkpoint", str(path), "--model", str(run / "model"), "--eval-dir", str(run / "eval"),
                              "--out", str(run / "x"), "--device", "cpu"])

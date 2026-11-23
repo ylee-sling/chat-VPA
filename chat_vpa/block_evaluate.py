@@ -6,7 +6,9 @@ block_evaluate.py -- Pass@k of the block sampler (Chat-VPA Algorithm 1) in the r
     python -m chat_vpa.block_evaluate --model data2/models/gemma-4-E2B --checkpoint runs/stage0-a/last.pt \\
         --block-size 16 --k-steps 4 --orders exact --eval-dir data2/eval --out runs/e0-check/eval
 
-The decoder is ``block_sampler.sample_blocks`` on a ``BlockDFM`` whose window carries the checkpoint's adapters.
+The decoder is ``block_sampler.sample_blocks`` on a ``BlockDFM`` whose window carries the checkpoint's adapters:
+a Stage 0 realizer's, or an E0 run's (``train_e0.py``; its registers and, unless ``--block-size`` is given, its
+block size).
 Everything else is the treatment of ``evaluate.py`` (rule 3 of CLAUDE.md): the prompts (HumanEval ``complete``,
 MBPP ``write``), the token draw, the truncation rule, the tests, the seeds (one generator per problem, seeded
 ``seed * 100003 + index``), and the autoregressive baseline's budget of ``--canvas-len`` new tokens, here
@@ -197,12 +199,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="google/gemma-4-E2B", help="Hub id or local directory of the backbone")
     p.add_argument("--revision", default=None)
-    p.add_argument("--checkpoint", type=Path, required=True, help="the adapters (a Stage 0 checkpoint)")
+    p.add_argument("--checkpoint", type=Path, required=True,
+                   help="the adapters: a Stage 0 checkpoint or an E0 run's (train_e0.py)")
     p.add_argument("--benchmarks", nargs="+", choices=("humaneval", "mbpp"), default=["mbpp"])
     p.add_argument("--eval-dir", type=Path, required=True, help="directory with HumanEval.jsonl.gz and mbpp.jsonl")
     p.add_argument("--mbpp-split", choices=sorted(MBPP_SPLITS), default="validation")
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--block-size", type=int, default=16, help="B")
+    p.add_argument("--block-size", type=int, default=None, help="B (default: an E0 run's own, else 16)")
     p.add_argument("--k-steps", type=int, nargs="+", default=[4], help="passes per block K")
     p.add_argument("--orders", nargs="+", choices=BLOCK_ORDERS, default=["exact"],
                    help="exact: the exact jump kernel (the primary sampler); prefix; confidence")
@@ -236,9 +239,10 @@ def main(argv: list[str] | None = None) -> int:
     device = resolve_device(args.device)
     model, hf_tokenizer = load_gemma4(args.model, revision=args.revision, token=os.environ.get("HF_TOKEN") or None)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if ckpt.get("stage", "stage0") != "stage0":
-        raise SystemExit(f"{args.checkpoint} is a {ckpt['stage']!r} checkpoint; this evaluator reads the adapters of "
-                         "a Stage 0 realizer")
+    stage = ckpt.get("stage", "stage0")
+    if stage not in ("stage0", "e0"):
+        raise SystemExit(f"{args.checkpoint} is a {stage!r} checkpoint; this evaluator reads a Stage 0 realizer or "
+                         "an E0 run")
     tokenizer = HFTokenizer(hf_tokenizer)
     spec = RealizerSpec.from_dict(ckpt["spec"])
     if spec.mask_id != tokenizer.mask_id:
@@ -248,13 +252,21 @@ def main(argv: list[str] | None = None) -> int:
     for tower in ("vision_tower", "audio_tower", "embed_vision", "embed_audio"):
         if hasattr(model.model, tower):
             setattr(model.model, tower, None)                       # text only
-    block_model = BlockDFM(realizer, num_registers=0)
+    num_registers = int(ckpt["config"].get("num_registers", 0)) if stage == "e0" else 0
+    block_model = BlockDFM(realizer, num_registers=num_registers)
+    if num_registers:
+        with torch.no_grad():
+            block_model.registers.copy_(ckpt["registers"].to(block_model.registers.dtype))
     block_model.to(device).eval()
+    block_size = args.block_size or (int(ckpt["config"]["block_size"]) if stage == "e0" else 16)
     schedule = args.schedule or ckpt["config"]["schedule"]
     common: dict[str, Any] = {"model": args.model, "revision": args.revision, "seed": args.seed,
                               "device": str(device), "checkpoint": str(args.checkpoint), "step": ckpt["step"],
-                              "checkpoint_stage": ckpt.get("stage", "stage0")}
-    configs = [BlockSamplerConfig(args.block_size, k, schedule, order, args.exit_budget, args.temperature, args.top_p,
+                              "checkpoint_stage": stage}
+    if stage == "e0":
+        common.update(arm=ckpt["config"]["arm"], train_block_size=int(ckpt["config"]["block_size"]),
+                      registers=num_registers)
+    configs = [BlockSamplerConfig(block_size, k, schedule, order, args.exit_budget, args.temperature, args.top_p,
                                   args.top_k) for order in args.orders for k in args.k_steps]
     fused = not args.separate_commit
 
