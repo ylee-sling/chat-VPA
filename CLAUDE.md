@@ -8,7 +8,9 @@ decision recorded in `docs/` or in the list at the end of this file says otherwi
 before changing any math, and cite the equation in a comment.
 
 **Status: nothing of Chat-VPA has been measured.** The code on `main` is text-VPA's verified Stage 0 code
-(`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`.
+(`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the Block-DFM
+core, its tests and the rollout generator exist; the trainer does not, and nothing is trained before the author
+has confirmed `docs/e0.md`.
 
 ## Layout
 
@@ -24,7 +26,14 @@ before changing any math, and cite the equation in a comment.
 | `chat_vpa/evaluate.py`, `report.py`, `analyze.py`, `preflight.py` | Sec. 6.2 | Pass@k of either decoder; paired bootstrap over problems; outcomes and the def-line check; checkpoint, tokenizer and data against what the code assumes |
 | `chat_vpa/runtime.py`, `device.py` | | checkpoints (`chat-vpa/1`, reads `text-vpa/1`), metric logging, backend selection |
 | `chat_vpa/evaluation/` | Sec. 6.2 | resource-limited execution (isolation, not a security sandbox), unbiased Pass@k, HumanEval and MBPP tasks |
-| `scripts/ncp/env.sh`, `stage0_sweep.sh` | | the server's rules in one place; the predecessor's sweep through the ported code |
+| `chat_vpa/block_masks.py` | Sec. 3.3 Eq. 5, Sec. 3.5 | `staircase_masks` (window rows of a training pass), `fused_masks` (commit and window rows of a sampling pass), `window_positions` |
+| `chat_vpa/block_dfm.py` | Secs. 3.2-3.5, Props. 1-2 | `BlockDFM` (the realizer inside block windows, the frozen backbone on everything committed): `prefill`, `fused_pass`, `window_pass`, `commit_pass`, `training_hidden`, registers; `BlockCache`; `PassAudit` |
+| `chat_vpa/block_data.py` | Sec. 3.3, Eq. 11, Sec. 4.3 | `collate_blocks`, `block_training_state` (per-block K, t, prefix-shaped or independent reveals, seam and filling weights), `right_open` (O_t) |
+| `chat_vpa/block_objective.py` | Eq. 12 | `dfm_loss` (L_DFM); L_Block-KD, L_Boundary, L_Step, L_Plan are not built |
+| `chat_vpa/block_sampler.py` | Algorithm 1, Prop. 3 | `sample_blocks`: fused commit, exact kernel / prefix / confidence orders, early exit, stopping, passes per block (K-bar), the audit |
+| `chat_vpa/block_evaluate.py`, `compare_samples.py` | Sec. 6.2 | Pass@k of the block sampler in `evaluate.py`'s format, the cache spot check; sample-by-sample comparison of two evaluations |
+| `chat_vpa/rollouts.py`, `rollout_throughput.py` | Sec. 4.1, Cor. 1, Sec. 6.2 | batched AR rollouts of the frozen backbone as training targets; the entropy of the decoding distribution along a target; the throughput measurement |
+| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` |
 | `docs/provenance.md` | | what was imported from text-VPA at `6f97346`, what changed, what was dropped; the corpus |
 
 ## Commands
@@ -72,6 +81,12 @@ ruff check .                            # must pass
 7. **Do not rename a parameter or a submodule of the realizer.** `~/text-VPA/runs/stage0-a/last.pt` must load
    (`tests/test_port.py`).
 8. **No stubs** in core logic (losses, kernels, samplers, trainers).
+9. **A block costs exactly its passes.** `sample_blocks` runs under `PassAudit`, which counts with hooks what
+   the network evaluated: K-bar passes per block, the commit rows through the KV-storing blocks only (Prop. 2).
+   Never remove or weaken it. Call networks as `module(...)`, never `module.forward(...)`.
+10. **The block sampler with B = N is the whole-canvas sampler.** One block that spans the canvas, without
+    registers, must reproduce `canvas_sampler.realize` token for token from the same seed (tested). This ties the
+    new code to the verified one; keep the test.
 
 ## Tests
 
@@ -110,4 +125,52 @@ ruff check .                            # must pass
 
 ## Decisions where the paper is silent (do not change silently)
 
-None yet.
+Made while building the Block-DFM core (23 November 2026). Those marked *(E0)* are open choices of the first
+experiment as well: `docs/e0.md` lists them with their alternatives, and they stand as defaults until the author
+has confirmed them there.
+
+- **Local blocks inside a window.** Eq. 5 says the sliding window "applies on top of M" and that a window always
+  lies inside it. The code keeps the two-sided rule |n(u) - n(v)| < W of the Stage 0 realizer among window rows
+  (`block_masks`): it never binds for B + 1 <= W, and it makes one block of B = N the whole-canvas realizer
+  (rule 10).
+- **Per-layer embeddings of non-tokens.** A masked slot takes the trainable mask vector and a register its own
+  vector as the main embedding; the per-layer embedding of both is looked up at the tokenizer's `<mask>` id (for
+  masked slots this is Stage 0's decision 5).
+- **Registers.** R vectors in `BlockDFM` (not in the realizer, so a Stage 0 checkpoint still loads), initialised
+  to the mask vector plus seeded Gaussian noise of standard deviation 0.1 times that vector's RMS, so that they
+  differ from one another. A causal window (the AR fallback) has no registers.
+- **Commit rows inside a fused pass** are the frozen backbone by a per-row adapter mask (`AdapterState.active`
+  as a tensor): LoRA and the modulation are computed and discarded on those rows. The commit rows leave the
+  pass before the first KV-sharing block.
+- **The clean stream of a training pass** is `Stage0Realizer.prefill` on the clean sequence, without gradients
+  and through the KV-storing blocks only; the window rows of all blocks then run in one pass (Prop. 1(b)). In E0
+  the clean rows are the frozen backbone, so L_AR (Eq. 14) has nothing to train.
+- **Blocks of a training response** *(E0)*. N = M B with M = ceil((program tokens + 1) / B): the block that
+  holds the first `<eos>` is the last one trained, because the sampler stops there.
+- **Prefix-shaped states** have ceil(kappa_t B - 1e-9) revealed slots: an integer product (the linear schedule's
+  k B / K) is not pushed up by rounding.
+- **Loss weights** *(E0)*. A slot that is both among the first b_0 of its block and `<eos>` filling gets the
+  filling's 0.1.
+- **Scheduled count of the prefix and confidence orders** *(E0)*. Sec. 3.5 says they "reveal the same expected
+  number of slots per pass". After the pass at t the block has ceil(kappa_{t+h} B) revealed slots, at least one
+  more than before, and all of them after the last pass; for the prefix order these are the prefix-shaped
+  training states of Sec. 3.3. (The whole-canvas sampler rounds pi times the masked count instead. Computed with
+  both rules: at (16, 4) that rule starts the second pass from 1 revealed slot where training has 2, at (32, 4)
+  the second and third from 2 and 9 where training has 3 and 10, and at (32, 2) the second from 9 where
+  training has 10.)
+- **Early exit.** Off at delta = 0: in exact arithmetic eps > 0, and float32 must not decide otherwise. eps uses
+  the posterior at temperature 1 without the tokens that are never drawn.
+- **Token draw of the block sampler** *(E0)*. Algorithm 1 says "draw x^i from the posterior"; the code draws with
+  the baseline's rule (temperature, top-k, top-p; `canvas_sampler.draw_tokens`), as rule 3 requires, and never
+  draws `[MASK]`, `<pad>` or `<bos>`.
+- **Stopping** *(E0)*. A row stops at the first block that holds `<eos>` (its output ends before that token) or
+  once the truncation rule has found the program's end in the blocks finished so far (checked after every
+  block); the budget is ceil(256 / B) blocks, the baseline's 256 new tokens.
+- **Batches.** Rows that have stopped leave the batch. A block of a batch runs until no row has a masked slot;
+  `row_passes` records for each row the passes after which its own block was complete, and K-bar is their mean.
+- **Rollout targets** *(E0)*. The generated text is cut by the truncation rule, tokenised again and followed by
+  one `<eos>`; a rollout that reaches the budget without a stop, or whose program does not fit the canvas, is
+  dropped (`rollouts.py`).
+- **Checkpoints of an AR-shift model in bfloat16.** A cache built block by block equals the one-pass prefill up
+  to rounding (float32: 1e-5 or less, tested; bfloat16: a few units in the last place), so a separate commit
+  pass (ablation A10) gives the fused commit's samples in float32 and need not in bfloat16.

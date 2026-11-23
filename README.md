@@ -29,6 +29,13 @@ What exists today:
   what was changed and what was dropped.
 - **Its tests:** 103 imported tests and 2 guards of the import pass on CPU with Python 3.12 and 3.13; among
   them, the realizer reproduces transformers' `Gemma4ForCausalLM` under causal masks on a tiny random model.
+- **On branch `e0`, the Block-DFM core** (not on `main` yet): the staircase, fused and window masks; the fused
+  commit; the block sampler with the exact kernel, the prefix-growing and the confidence orders and a pass
+  audit; the staircase training pass and the block loss; batched autoregressive rollouts as training targets.
+  Its tests check the masks against an explicit loop over the preprint's Eq. 5, the training pass against the
+  sampling passes and against transformers' own Gemma 4 under that mask, the cache against the frozen
+  backbone's, one block spanning the canvas against the whole-canvas sampler, and a causal window against
+  `generate`. These tests verify the implementation, not the method.
 
 The numbers that motivate the design are measurements of the predecessor (text-VPA's `docs/stage0.md` and
 `docs/stage1.md`), not of this code.
@@ -37,8 +44,8 @@ The numbers that motivate the design are measurements of the predecessor (text-V
 
 The first experiment is **E0**, the bridge experiment of the preprint's Sec. 6.2: Block-DFM on the frozen
 Gemma 4 E2B, trained under the staircase block-causal mask on human references or on the backbone's own
-autoregressive rollouts, evaluated on MBPP's validation split. Its code and its pre-registration are developed on
-branch `e0`.
+autoregressive rollouts, evaluated on MBPP's validation split. Its pre-registration is
+[`docs/e0.md`](docs/e0.md) on branch `e0`; no training starts before the author has confirmed it.
 
 ## Install and test
 

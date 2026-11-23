@@ -93,16 +93,26 @@ class RealizerSpec:
 
 class AdapterState:
     """Switch shared by every adapter of one realizer: off while the frozen backbone runs (prefill), on for the
-    canvas. ``modulation`` is ``[B, L, 4, d]`` (shift and scale for the two pre-norms of each block) or None.
+    canvas.
+
+    ``active`` is a bool for all rows of a call, or a bool tensor ``[B, T]`` (``[T]`` broadcasts) that is True on
+    the rows the adapters act on: in a fused pass (Chat-VPA Algorithm 1) the commit rows are the frozen backbone
+    and the window rows are the realizer, inside one call.
+
+    ``modulation`` is None, or ``[B, L, 4, d]`` (shift and scale for the two pre-norms of each block, one flow
+    time per batch row), or ``[B, G, L, 4, d]`` with ``groups`` ``[B, T]`` int64 naming the group of each row
+    (one flow time per block of a staircase training pass, Sec. 3.3).
     """
 
     def __init__(self) -> None:
-        self.active: bool = False
+        self.active: bool | Tensor = False
         self.modulation: Tensor | None = None
+        self.groups: Tensor | None = None
 
 
 class LoRALinear(nn.Module):
-    """A frozen ``nn.Linear`` plus a low-rank update that acts only while ``state.active``.
+    """A frozen ``nn.Linear`` plus a low-rank update that acts only while ``state.active``, and with a row mask
+    only on its rows (the other rows get the frozen layer's output, exactly).
 
     Shapes: ``[..., in]`` -> ``[..., out]``. ``lora_a [r, in]`` (Kaiming-uniform), ``lora_b [out, r]`` (zero).
     """
@@ -120,10 +130,14 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         y = self.base(x)
-        if not self._state[0].active:
+        active = self._state[0].active
+        if active is False:
             return y
         update = F.linear(F.linear(x, self.lora_a.to(x.dtype)), self.lora_b.to(x.dtype))
-        return y + self.scale * update.to(y.dtype)
+        adapted = y + self.scale * update.to(y.dtype)
+        if active is True:
+            return adapted
+        return torch.where(active[..., None], adapted, y)
 
 
 class ModulatedNorm(nn.Module):
@@ -142,10 +156,22 @@ class ModulatedNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         y = self.norm(x)
         state = self._state[0]
-        if not state.active or state.modulation is None:
+        if state.active is False or state.modulation is None:
             return y
-        m = state.modulation[:, self.layer_idx, 2 * self.slot: 2 * self.slot + 2].to(y.dtype)    # [B, 2, d]
-        return y * (1.0 + m[:, 1:2]) + m[:, 0:1]
+        if state.modulation.dim() == 4:                                 # one (t, h) per batch row
+            m = state.modulation[:, self.layer_idx, 2 * self.slot: 2 * self.slot + 2].to(y.dtype)    # [B, 2, d]
+            shift, scale = m[:, 0:1], m[:, 1:2]
+        else:                                                           # one (t, h) per group of rows
+            if state.groups is None:
+                raise ValueError("a modulation per group needs the group of every row")
+            m = state.modulation[:, :, self.layer_idx, 2 * self.slot: 2 * self.slot + 2].to(y.dtype)  # [B, G, 2, d]
+            index = state.groups[:, :, None, None].expand(-1, -1, 2, m.shape[-1])
+            m = m.gather(1, index)                                      # [B, T, 2, d]
+            shift, scale = m[:, :, 0], m[:, :, 1]
+        modulated = y * (1.0 + scale) + shift
+        if state.active is True:
+            return modulated
+        return torch.where(state.active[..., None], modulated, y)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -370,27 +396,41 @@ class Stage0Realizer(nn.Module):
             per_layer = self.text.project_per_layer_inputs(embeds, self.text.get_per_layer_inputs(ids, None))
         return embeds, per_layer
 
-    def _block(self, hidden: Tensor, layer_input: Tensor | None, *, index: int, active: bool,
-               modulation: Tensor | None, **kwargs: Any) -> Tensor:
+    def _block(self, hidden: Tensor, layer_input: Tensor | None, *, index: int, active: bool | Tensor,
+               modulation: Tensor | None, groups: Tensor | None = None, **kwargs: Any) -> Tensor:
         """Block ``index`` with the adapter switch set for the duration of the call. The switch is an argument,
-        not ambient state, because activation checkpointing calls this again during the backward pass."""
-        previous = (self.state.active, self.state.modulation)
-        self.state.active, self.state.modulation = active, modulation
+        not ambient state, because activation checkpointing calls this again during the backward pass.
+        ``active``, ``modulation`` and ``groups`` as in ``AdapterState``."""
+        previous = (self.state.active, self.state.modulation, self.state.groups)
+        self.state.active, self.state.modulation, self.state.groups = active, modulation, groups
         try:
             return self.text.layers[index](hidden, layer_input, **kwargs)
         finally:
-            self.state.active, self.state.modulation = previous
+            self.state.active, self.state.modulation, self.state.groups = previous
 
     def _run(self, hidden: Tensor, per_layer: Tensor | None, position_ids: Tensor, masks: dict[str, Tensor],
-             cache: Any, num_layers: int, checkpointing: bool, active: bool = False,
-             modulation: Tensor | None = None) -> Tensor:
-        """Blocks 0 .. num_layers-1 of the backbone (the loop of ``Gemma4TextModel.forward``)."""
+             cache: Any, num_layers: int, checkpointing: bool, active: bool | Tensor = False,
+             modulation: Tensor | None = None, groups: Tensor | None = None, commit_rows: int = 0) -> Tensor:
+        """Blocks 0 .. num_layers-1 of the backbone (the loop of ``Gemma4TextModel.forward``).
+
+        ``commit_rows`` > 0 (a fused pass, Chat-VPA Prop. 2(b)): the first ``commit_rows`` rows run through the
+        KV-storing blocks only and are dropped before the first KV-sharing block; nothing above reads their
+        states, and the keys and values they wrote stay in ``shared``. The result then holds the other rows.
+        ``active`` and ``groups``, when tensors, and the masks cover all rows and are cut along with them.
+        """
         masks = _for_implementation(masks, self._implementation, hidden.dtype)
         rotary = {kind: self.text.rotary_emb(hidden, position_ids, kind) for kind in set(self.layer_types)}
         shared: UserDict = UserDict()
         for i in range(num_layers):
+            if commit_rows and i == self.num_kv_layers:
+                hidden, position_ids = hidden[:, commit_rows:], position_ids[:, commit_rows:]
+                per_layer = per_layer[:, commit_rows:] if per_layer is not None else None
+                masks = {kind: m[:, :, commit_rows:] for kind, m in masks.items()}
+                rotary = {kind: (cos[:, commit_rows:], sin[:, commit_rows:]) for kind, (cos, sin) in rotary.items()}
+                active = active[..., commit_rows:] if isinstance(active, Tensor) else active
+                groups = groups[:, commit_rows:] if groups is not None else None
             kind = self.layer_types[i]
-            block = partial(self._block, index=i, active=active, modulation=modulation,
+            block = partial(self._block, index=i, active=active, modulation=modulation, groups=groups,
                             shared_kv_states=shared, position_embeddings=rotary[kind],
                             attention_mask=masks[kind], position_ids=position_ids, past_key_values=cache)
             layer_input = per_layer[:, :, i, :] if per_layer is not None else None
