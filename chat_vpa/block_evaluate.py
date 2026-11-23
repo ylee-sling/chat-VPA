@@ -127,6 +127,7 @@ def block_samples(model: BlockDFM, tokenizer: Stage0Tokenizer, tasks: Sequence[E
             "seconds_per_block": round(seconds / max(batch_blocks, 1), 4),
             "seconds_per_pass": round(seconds / max(batch_passes + len(tasks), 1), 4),
             "mean_tokens": round(tokens_out / total, 2),
+            "rows_per_batch": min(batch_size, num_samples),        # the samples of one problem, one prompt cache
             "pass_audit": "passed" if audit else "off"}
     return texts, info
 

@@ -13,8 +13,9 @@ Table 5): do not repeat those statements, and do not edit the preprint unasked.
 code (`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the
 Block-DFM core, its tests, the rollout generator and the checks for the L4 exist, and the checks have run (the port
 is exact: `docs/e0.md`, Section 2.4). The author has confirmed all of `docs/e0.md` (C1 to C12, 23 November 2026);
-it is frozen, and a later change is a deviation recorded in its Section 9. The rollout writer and the E0 trainer
-exist and are tested on the CPU with the tiny model; neither has run on the L4. Nothing has been trained yet.
+it is frozen, and a later change is a deviation recorded in its Section 9. The rollout writer, the E0 trainer, the
+evaluation script and the report exist and are tested on the CPU with the tiny model; of these only the writer's
+batch check has run on the L4. Nothing has been trained yet.
 
 ## Layout
 
@@ -39,8 +40,9 @@ exist and are tested on the CPU with the tiny model; neither has run on the L4. 
 | `chat_vpa/rollouts.py`, `rollout_throughput.py` | Sec. 4.1, Cor. 1, Sec. 6.2 | batched AR rollouts of the frozen backbone as training targets; the entropy of the decoding distribution along a target; the throughput measurement (`--kind` for one prompt format; writes `rollouts.jsonl`) |
 | `chat_vpa/inspect_rollouts.py` | | how the rollouts of a throughput run ended: for `write` prompts, where the named function ends and what follows it (a diagnostic for C6; changes no rule) |
 | `chat_vpa/rollout_writer.py` | Sec. 6.2 | E0's data (C6): the validation set and the kept training set, stratified by format, each example with its reference and one rollout; resumable chunks, halving the batch on out-of-memory; the summary of `docs/e0.md` Section 7 (kept shares, stops, lengths, entropy) |
+| `chat_vpa/e0_report.py` | Secs. 6.2, 6.4 | E0's report: the table of `docs/e0.md` Section 6 with paired-bootstrap intervals, H1, H2 (C10), H3 and the reading of a failed H1 (C11), Section 7's tables, and the deviations of any configuration from what Section 5 and C8 fix |
 | `chat_vpa/train_e0.py` | Secs. 3.3, 6.2, Eq. 12 | E0's trainer: text-VPA's Stage 0 loop with `collate_blocks`, `block_training_state` and `dfm_loss` behind its hooks; `RolloutData`, `EpochStream`; held-out L_DFM on both targets; checkpoints of stage `e0` (registers, the data's fingerprint), read by `block_evaluate` |
-| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` (`inspect` runs `inspect_rollouts.py` on its output), `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back), `e0_data.sh` (`check`: batch 128 against 256; then the data), `e0_train.sh` (one run of T16, R16, T32, R32; `STOP_AT=100` for the timing) |
+| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` (`inspect` runs `inspect_rollouts.py` on its output), `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back), `e0_data.sh` (`check`: batch 128 against 256; then the data), `e0_train.sh` (one run of T16, R16, T32, R32; `STOP_AT=100` for the timing), `e0_eval.sh` (a run's final checkpoint, 6 configurations; `report`) |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
 | `docs/provenance.md` | | what was imported from text-VPA at `6f97346`, what changed, what was dropped; the corpus |

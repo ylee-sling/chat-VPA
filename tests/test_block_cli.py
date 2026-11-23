@@ -99,6 +99,7 @@ def test_short_blocks_under_the_pass_audit_with_a_cache_check(run):
     assert exact["problems"] == 2 and exact["samples_per_problem"] == 2 and exact["max_blocks"] == 8
     assert exact["pass_audit"] == "passed" and exact["fused_commit"] is True and exact["registers"] == 0
     assert 1.0 <= exact["mean_passes_per_block"] <= 2.0 and 1 <= exact["mean_blocks"] <= 8
+    assert exact["rows_per_batch"] == 2                                          # one problem's samples per batch
     assert abs(sum(exact["stops"].values()) - 1.0) < 1e-3 and exact["seconds_per_block"] > 0
     assert [c["task_id"] for c in exact["cache_check"]] == ["MBPP/511", "MBPP/512"]
     for check in exact["cache_check"]:                                           # (bfloat16 weights, as released)
