@@ -5,12 +5,15 @@ Distillation* (Yeonseok Lee, SLING AI Inc.; draft of 22 November 2026, `preprint
 the author's project files and not in this repository). **The preprint is the ground truth** for every formula
 and for the design of each experiment. If the code and the preprint disagree, the preprint wins, except where a
 decision recorded in `docs/` or in the list at the end of this file says otherwise. Read the relevant section
-before changing any math, and cite the equation in a comment.
+before changing any math, and cite the equation in a comment. `docs/preprint-corrections.md` lists what the draft
+is known to get wrong (the "two tokens per pass" reading of K = 128, the finished latent oracle, two points of
+Table 5): do not repeat those statements, and do not edit the preprint unasked.
 
 **Status: nothing of Chat-VPA has been measured.** The code on `main` is text-VPA's verified Stage 0 code
 (`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the Block-DFM
-core, its tests and the rollout generator exist; the trainer does not, and nothing is trained before the author
-has confirmed `docs/e0.md`.
+core, its tests, the rollout generator and the checks for the L4 exist; the trainer does not, and nothing is
+trained before the author has confirmed `docs/e0.md` (a draft: every choice in its Section 3 is open until its
+Section 9 records the author's decision).
 
 ## Layout
 
@@ -33,7 +36,9 @@ has confirmed `docs/e0.md`.
 | `chat_vpa/block_sampler.py` | Algorithm 1, Prop. 3 | `sample_blocks`: fused commit, exact kernel / prefix / confidence orders, early exit, stopping, passes per block (K-bar), the audit |
 | `chat_vpa/block_evaluate.py`, `compare_samples.py` | Sec. 6.2 | Pass@k of the block sampler in `evaluate.py`'s format, the cache spot check; sample-by-sample comparison of two evaluations |
 | `chat_vpa/rollouts.py`, `rollout_throughput.py` | Sec. 4.1, Cor. 1, Sec. 6.2 | batched AR rollouts of the frozen backbone as training targets; the entropy of the decoding distribution along a target; the throughput measurement |
-| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` |
+| `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh`, `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back) |
+| `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
+| `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
 | `docs/provenance.md` | | what was imported from text-VPA at `6f97346`, what changed, what was dropped; the corpus |
 
 ## Commands
@@ -120,6 +125,9 @@ ruff check .                            # must pass
   match by prefix, so always use `-t "=name"`. Bash reads a running script from disk: never `git pull` while
   one runs.
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (the scripts set it).
+- So that nothing is written outside `runs/`, `env.sh` also sets `TMPDIR` to `runs/tmp`,
+  `PYTHONDONTWRITEBYTECODE=1` and the Hub's offline switches. Run the tests on the server through a script
+  (`port_check.sh` with `STAGES=tests`), not with a bare `pytest`, which would write its cache into the checkout.
 - The evaluation harness executes generated code with resource limits; it is not a security sandbox.
 - Commands for the author are short: anything long goes into a script in the repository.
 

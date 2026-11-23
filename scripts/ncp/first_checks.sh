@@ -4,7 +4,7 @@
 #
 # first_checks.sh -- everything the L4 has to say before E0 is confirmed, one after the other in one tmux
 # session (one GPU job at a time). Predicted, not measured: one to two hours (text-VPA's sweep took 25 to 40
-# minutes per configuration, and the port check holds three):
+# minutes per configuration, as the author reports, and the port check holds three):
 #
 #   1. rollout_throughput.sh   how many AR rollouts are affordable            runs/e0-throughput
 #   2. port_check.sh           the port reproduces the predecessor's samples  runs/port-check
