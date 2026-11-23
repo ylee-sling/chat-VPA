@@ -63,6 +63,11 @@ ruff check .                            # must pass
 7. **The author decides** the license, the open choices of an experiment and any deviation from the preprint.
    Ask first; record every decision in `docs/` with its date.
 8. **Git:** `main` holds the import; work on E0 goes to branch `e0`; pull requests when the author asks.
+9. **Commit trailers** (the author's request of 23 November 2026). Every commit message ends with one block of
+   trailers, with no blank line inside it (git and GitHub read only the last paragraph as trailers): first
+   `Co-authored-by: Yeonseok Lee <ylee@sling.ai.kr>`, then the attribution lines that the session's instructions
+   give. The commits up to `2076e2d` on `main` and `cfb51e7` on `e0` lack the first line; they are not rewritten
+   or force-pushed unless the author asks.
 
 ## Rules of the code (text-VPA's Stage 0 rules, for E0)
 
