@@ -257,3 +257,39 @@ def test_the_writer_on_the_tiny_model(tiny, tmp_path, capsys):
     # A run does not resume with other settings.
     with pytest.raises(SystemExit, match="other settings"):
         _cli(tiny, out, "--kept", "9")
+
+
+def test_the_progress_display_predicts_the_hours_left_and_the_examples_read(tmp_path):
+    """The prediction of an unfinished run, against arithmetic done by hand."""
+    out = tmp_path / "out"
+    quotas = {"validation": {"complete": 3, "write": 1}, "train": {"complete": 100, "write": 20}}
+    (out / "validation-chunks").mkdir(parents=True)
+    (out / "train-chunks").mkdir()
+    (out / "settings.json").write_text(json.dumps({"quotas": quotas}))
+    (out / "validation-chunks" / "state.json").write_text(json.dumps(
+        {"chunks": 1, "kept": quotas["validation"], "source": {"read": 9},
+         "log": [{"candidates": {"complete": 6, "write": 3}, "seconds": 36.0}]}))
+    (out / "validation.jsonl.gz").write_bytes(b"")
+    # Two chunks: 100 complete and 25 write candidates from 125 examples, 50 and 5 kept, in 3,600 s.
+    log = [{"candidates": {"complete": 60, "write": 15}, "seconds": 2_000.0},
+           {"candidates": {"complete": 40, "write": 10}, "seconds": 1_600.0}]
+    state = {"chunks": 2, "kept": {"complete": 50, "write": 5}, "source": {"read": 125}, "log": log}
+    (out / "train-chunks" / "state.json").write_text(json.dumps(state))
+    lines = rw.progress_text(out).splitlines()
+    assert lines[1] == ("  validation: kept {'complete': 3, 'write': 1} of {'complete': 3, 'write': 1} after 1 chunks, "
+                        "9 examples read, 0.01 h; finished")
+    # complete: 50 more x 100/50 = 100 candidates; write: 15 more x 25/5 = 75; 175 candidates at 3,600/125 s each
+    # = 1.4 h. The source is read until write is full: 125 x 20/5 = 500 examples (complete would need 250).
+    assert lines[2] == ("  train: kept {'complete': 50, 'write': 5} of {'complete': 100, 'write': 20} after 2 chunks, "
+                        "125 examples read, 1.00 h; about 1.4 h left and 500 examples read in all "
+                        "(predicted from the rates so far)")
+    # Once complete is full, only write counts.
+    state["kept"] = {"complete": 100, "write": 10}
+    (out / "train-chunks" / "state.json").write_text(json.dumps(state))
+    assert rw.progress_text(out).splitlines()[2].endswith(
+        "about 0.2 h left and 250 examples read in all (predicted from the rates so far)")   # 10 x 25/10 x 28.8 s = 720 s
+    # An open format that has kept nothing yet gives no prediction.
+    state["kept"] = {"complete": 50, "write": 0}
+    (out / "train-chunks" / "state.json").write_text(json.dumps(state))
+    assert rw.progress_text(out).splitlines()[2].endswith(
+        "; too early to predict (a format with an open quota has kept nothing yet)")

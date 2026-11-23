@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import os
 import sys
 import time
@@ -374,17 +375,23 @@ def progress_text(out: Path) -> str:
             candidates.update(entry["candidates"])
         seconds = sum(e["seconds"] for e in log)
         quota = json.loads((out / "settings.json").read_text())["quotas"][name]
-        left = 0.0
-        for f in FORMATS:
-            remaining = quota[f] - state["kept"][f]
-            if remaining > 0 and candidates[f] and state["kept"][f]:
-                left += remaining * candidates[f] / state["kept"][f]
-        per_candidate = seconds / max(sum(candidates.values()), 1)
-        done = (out / f"{name}.jsonl.gz").exists()
-        lines.append(f"  {name}: kept {state['kept']} of {quota} after {state['chunks']} chunks, "
-                     f"{state['source']['read']} examples read, {seconds / 3600:.2f} h"
-                     + ("; finished" if done else
-                        f"; about {left * per_candidate / 3600:.1f} h left (predicted from the rates so far)"))
+        kept, read = state["kept"], int((state["source"] or {}).get("read", 0))
+        open_formats = [f for f in FORMATS if kept[f] < quota[f]]
+        line = (f"  {name}: kept {kept} of {quota} after {state['chunks']} chunks, {read} examples read, "
+                f"{seconds / 3600:.2f} h")
+        if (out / f"{name}.jsonl.gz").exists():
+            line += "; finished"
+        elif all(kept[f] for f in open_formats):
+            # At the rates so far, an open format needs (remaining) x (candidates per kept example) more
+            # candidates, and the source is read until the last quota is full: read x quota / kept examples.
+            left = sum((quota[f] - kept[f]) * candidates[f] / kept[f] for f in open_formats)
+            per_candidate = seconds / max(sum(candidates.values()), 1)
+            total = max((math.ceil(read * quota[f] / kept[f]) for f in open_formats), default=read)
+            line += (f"; about {left * per_candidate / 3600:.1f} h left and {total:,} examples read in all "
+                     "(predicted from the rates so far)")
+        else:
+            line += "; too early to predict (a format with an open quota has kept nothing yet)"
+        lines.append(line)
     return "\n".join(lines)
 
 

@@ -10,7 +10,11 @@
 #                                        first 1,024 prompts, in tmux (session e0-batch-check), about 15 minutes
 #   bash scripts/ncp/e0_data.sh          start, or resume after the last finished chunk, in tmux (SESSION)
 #   bash scripts/ncp/e0_data.sh run      the same in the foreground
-#   bash scripts/ncp/e0_data.sh show     the check's result, and the progress or the summary of the data
+#   bash scripts/ncp/e0_data.sh show     the check's result, and the progress (hours left and examples read in
+#                                        all, predicted from the rates so far) or the summary of the data
+#
+# One pass of the corpus is at most 1,990,070 examples (fewer: the stream drops rows that do not fit). The writer
+# stops rather than wrap into a second pass, so a prediction of more examples than that is for the author (C6).
 #
 # Variables (defaults in brackets; scripts/ncp/env.sh has the server's):
 #   OUT         [runs/e0-data]   must lie under this repository's runs/
