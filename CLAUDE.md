@@ -14,8 +14,8 @@ code (`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), dev
 Block-DFM core, its tests, the rollout generator and the checks for the L4 exist, and the checks have run (the port
 is exact: `docs/e0.md`, Section 2.4). The author has confirmed all of `docs/e0.md` (C1 to C12, 23 November 2026);
 it is frozen, and a later change is a deviation recorded in its Section 9. The rollout writer, the E0 trainer, the
-evaluation script and the report exist and are tested on the CPU with the tiny model; of these only the writer's
-batch check has run on the L4. Nothing has been trained yet.
+evaluation script and the report exist and are tested on the CPU with the tiny model. The writer has run on the L4
+and E0's training data is written (`docs/e0.md`, Section 4); no training run has finished yet.
 
 ## Layout
 

@@ -619,7 +619,8 @@ def render(report: Mapping[str, Any]) -> str:
         for name in ("validation", "train"):
             s = data[name]
             lines.append(f"- {name}: {s['records']} kept of quota {s['quota']}; kept rate {s['kept_rate']}; "
-                         f"{s['source_examples_read']} examples read; {s['generation_hours']} h")
+                         f"candidates {s.get('candidates', '--')} of {s['source_examples_read']} examples read; "
+                         f"{s['generation_hours']} h")
             lines.append(f"  stops: {s['stops']}")
         lines.append(f"- kept `write` rollouts that define the named function: {data['named_function']}")
         for f, stats in data.get("lengths", {}).items():
