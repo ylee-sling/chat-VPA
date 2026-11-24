@@ -255,6 +255,12 @@ def test_the_report_fills_the_table_and_reads_the_rules(tmp_path, capsys):
     assert tag["outcomes"]["wrong"] == pytest.approx(1 - 60 / 450) and tag["rows_per_batch"] == 5
     assert "## H1, the bridge: " in text and "| Block-DFM, arm T (H1, H3) | AR rollouts | (16, 4) | 4 |" in text
     assert "the repetition favours arm T" in text and "kept rate" in text
+    # The arms of a block size must start from the same held-out losses (the same untrained model).
+    _write_run(runs, "R32", {"references": (5.1, 3.0, 2.8, 2.7, 2.6), "rollouts": FALLING})
+    assert er.main(args) == 0
+    deviations = json.loads((out / "report.json").read_text())["deviations"]
+    assert "T32 and R32 start from different held-out losses on the references (5.0000 and 5.1000 at step 0): " \
+           "the two arms should share the untrained model, the validation set and its states" in deviations
     # A configuration scored on other problems is refused.
     _write_config(runs / "e0-T16" / "eval" / "mbpp" / "block-B16-K2", 5, _summary("T16", 16, 2, "exact"))
     with open(runs / "e0-T16" / "eval" / "mbpp" / "block-B16-K2" / "samples.jsonl", "a") as handle:

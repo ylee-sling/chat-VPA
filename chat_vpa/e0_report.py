@@ -50,8 +50,9 @@ docs/e0.md Section 8):
   evaluation than at its lowest one. The rise is printed with it.
 
 The report also checks every configuration against what Section 5 and C8 fix (problems, samples, split, token
-draw, no early exit, fused commit, no registers, the run's final checkpoint, the pass audit) and lists what does
-not match under "Deviations found by the report". Writes ``OUT/report.md`` and ``OUT/report.json``.
+draw, no early exit, fused commit, no registers, the run's final checkpoint, the pass audit), and that the two arms
+of a block size start from the same held-out losses at step 0, and lists what does not match under "Deviations
+found by the report". Writes ``OUT/report.md`` and ``OUT/report.json``.
 """
 
 from __future__ import annotations
@@ -82,6 +83,7 @@ THRESHOLD = 0.5            # H1 (Section 5.1)
 FLOOR = 0.02               # "near the floor" (Section 5.4, C11)
 RESAMPLES, SEED = 10_000, 0
 EPS = 1e-9                 # Pass@1 moves in steps of 1/450; below this, two values are equal
+STEP0_TOLERANCE = 1e-3     # nats: two arms' untrained held-out losses, equal up to GPU rounding
 AR_DOCUMENTED = 0.238      # the released generate on MBPP validation (measured on the predecessor)
 # The two readings of the module docstring that docs/e0.md (Section 8) proposes; printed with every report.
 READINGS = ("proposed on 23 November 2026 and not yet confirmed by the author (docs/e0.md, Section 8): arm R is "
@@ -449,6 +451,17 @@ def build(runs_dir: Path, baseline_dir: Path, predecessor_dir: Path | None = Non
                                              "stops", "seconds_per_block", "seconds_per_pass", "rows_per_batch",
                                              "pass_audit", "step")}}
         runs[name] = info
+
+    # At step 0 the two arms of a block size are the same untrained model on the same held-out states, so their
+    # held-out losses must agree (to GPU rounding).
+    for block in (16, 32):
+        for target in ("references", "rollouts"):
+            t0 = dict(runs[f"T{block}"]["curves"][target]).get(0)
+            r0 = dict(runs[f"R{block}"]["curves"][target]).get(0)
+            if t0 is not None and r0 is not None and abs(t0 - r0) > STEP0_TOLERANCE:
+                deviations.append(f"T{block} and R{block} start from different held-out losses on the {target} "
+                                  f"({t0:.4f} and {r0:.4f} at step 0): the two arms should share the untrained "
+                                  "model, the validation set and its states")
 
     def pass_of(name: str, cell: tuple[int, int], order: str) -> np.ndarray | None:
         return vectors_of.get((name, *cell, order))
