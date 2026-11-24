@@ -101,6 +101,13 @@ def test_h3_is_decided_at_16_4_and_reads_the_interval():
     assert out["status"] == "holds" and "an order effect remains" in out["text"]
     out = er.h3_verdict({(16, 4): (-0.01, -0.03, 0.01)})
     assert out["status"] == "fails" and "removed the order effect" in out["text"]
+    # The floor caveat (24 November 2026): both orders at most 2.0% at (16, 4).
+    zero = {(16, 4): (0.0, 0.0, 0.0), (32, 2): (0.0222, 0.0, 0.05)}
+    out = er.h3_verdict(zero, {(16, 4): (0.0, 0.02), (32, 2): (0.02, 0.0422)})
+    assert out["status"] == "not testable at this floor" and out["cells"][(16, 4)]["at_floor"] is True
+    assert out["cells"][(32, 2)]["at_floor"] is False and "removed the order effect" in out["cells"][(32, 2)]["reading"]
+    out = er.h3_verdict(zero, {(16, 4): (0.0, 0.0223)})                      # one order above the floor
+    assert out["status"] == "holds" and "removed the order effect" in out["text"]
 
 
 def test_section_5_4_selects_its_row():
@@ -250,6 +257,7 @@ def test_the_report_fills_the_table_and_reads_the_rules(tmp_path, capsys):
     assert h2["growth"][0] == pytest.approx(20 / 450)
     assert h2["repetition"]["32"]["status"] == "no sign"
     assert report["h3"]["cells"]["(32, 4)"]["at_least_as_good"] is False
+    assert not any(c["at_floor"] for c in report["h3"]["cells"].values())
     assert report["deviations"] == ["R32 block-B32-K2-confidence: exit_budget is 0.05, not 0.0"]
     tag = report["runs"]["T16"]["configurations"]["block-B16-K4"]
     assert tag["outcomes"]["wrong"] == pytest.approx(1 - 60 / 450) and tag["rows_per_batch"] == 5

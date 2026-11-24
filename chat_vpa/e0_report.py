@@ -36,18 +36,19 @@ The rules, as docs/e0.md fixes them:
   arm T, and the reading says so.
 - H3 (5.3): Pass@1(prefix-growing) - Pass@1(exact kernel), arm T, at each cell; at least as good if >= 0;
   decided at (16, 4). An interval that includes 0 is read as the block structure and the target having removed
-  the order effect.
+  the order effect, unless both orders are at the floor (at most 2.0%): then the cell is "not testable at this
+  floor" (the caveat added on 24 November 2026).
 - If H1 fails (5.4, C11): arm R near the floor is Pass@1(R16, (16, 4), exact) <= 2.0%; a clear gain of arm T is
   a lower end of D(16, 4)'s interval above 0. A clear gain selects the second row of Section 5.4's table, arm R
   near the floor without one the first, and neither the third.
 
-Two readings where the text needs a number that docs/e0.md does not give (proposed on 23 November 2026,
-docs/e0.md Section 8):
+Three readings that the author confirmed on 24 November 2026, before any result (docs/e0.md, Sections 8 and 9):
 
 - "arm R at the floor at every cell" (C10's caveat): arm R's exact-kernel Pass@1 is at most 2.0%, the floor of
   C11, at all four cells;
 - "arm R's held-out loss rises" (C6): a run's pooled held-out L_DFM on its own target is higher at its last
-  evaluation than at its lowest one. The rise is printed with it.
+  evaluation than at its lowest one. The rise is printed with it;
+- H3's floor caveat: both orders at most 2.0% at a cell read "not testable at this floor".
 
 The report also checks every configuration against what Section 5 and C8 fix (problems, samples, split, token
 draw, no early exit, fused commit, no registers, the run's final checkpoint, the pass audit), and that the two arms
@@ -85,10 +86,11 @@ RESAMPLES, SEED = 10_000, 0
 EPS = 1e-9                 # Pass@1 moves in steps of 1/450; below this, two values are equal
 STEP0_TOLERANCE = 1e-3     # nats: two arms' untrained held-out losses, equal up to GPU rounding
 AR_DOCUMENTED = 0.238      # the released generate on MBPP validation (measured on the predecessor)
-# The two readings of the module docstring that docs/e0.md (Section 8) proposes; printed with every report.
-READINGS = ("proposed on 23 November 2026 and not yet confirmed by the author (docs/e0.md, Section 8): arm R is "
-            "\"at the floor everywhere\" when its exact-kernel Pass@1 is at most 2.0% at all four cells, and a "
-            "held-out curve \"rises\" when its last value is above its lowest")
+# The readings of the module docstring that the author confirmed (docs/e0.md, Section 9); printed with every report.
+READINGS = ("confirmed by the author on 24 November 2026, before any result (docs/e0.md, Section 9): arm R is \"at "
+            "the floor everywhere\" when its exact-kernel Pass@1 is at most 2.0% at all four cells; a held-out curve "
+            "\"rises\" when its last value is above its lowest; H3 is \"not testable at this floor\" where both "
+            "orders are at most 2.0%")
 
 # What Section 5 and C8 fix for every evaluated configuration of a block run.
 FIXED: dict[str, Any] = {"benchmark": "mbpp", "split": "validation", "problems": 90, "samples_per_problem": 5,
@@ -206,23 +208,30 @@ def h2_verdict(d: Mapping[tuple[int, int], Interval], growth: Interval | None,
     return out
 
 
-def h3_verdict(d: Mapping[tuple[int, int], Interval]) -> dict[str, Any]:
-    """H3 on prefix-growing minus exact kernel, arm T, per cell found; decided at (16, 4)."""
+def h3_verdict(d: Mapping[tuple[int, int], Interval],
+               arm_t: Mapping[tuple[int, int], tuple[float, float]] | None = None) -> dict[str, Any]:
+    """H3 on prefix-growing minus exact kernel, arm T, per cell found; decided at (16, 4). ``arm_t`` holds arm T's
+    Pass@1 (exact kernel, prefix-growing) per cell, for the floor caveat."""
     cells = {}
     for cell in CELLS:
         if cell not in d:
             continue
         point, low, high = d[cell]
-        if low <= EPS and high >= -EPS:
+        at_floor = arm_t is not None and cell in arm_t and all(p <= FLOOR + EPS for p in arm_t[cell])
+        if at_floor:
+            reading = "not testable at this floor (both orders at most 2.0%)"
+        elif low <= EPS and high >= -EPS:
             reading = "the interval includes 0: read as the block structure and the target having removed the order effect"
         elif low > EPS:
             reading = "prefix-growing is clearly better: an order effect remains, in the direction of Finding 1"
         else:
             reading = "the exact kernel is clearly better"
-        cells[cell] = {"at_least_as_good": point >= -EPS, "reading": reading}
+        cells[cell] = {"at_least_as_good": point >= -EPS, "at_floor": at_floor, "reading": reading}
     if H1_CELL not in cells:
         return {"status": "pending", "cells": cells, "text": "pending: T16 at (16, 4), both orders"}
     decided = cells[H1_CELL]
+    if decided["at_floor"]:
+        return {"status": "not testable at this floor", "cells": cells, "text": decided["reading"]}
     status = "holds" if decided["at_least_as_good"] else "fails"
     return {"status": status, "cells": cells, "text": f"{status}; {decided['reading']}"}
 
@@ -522,11 +531,13 @@ def build(runs_dir: Path, baseline_dir: Path, predecessor_dir: Path | None = Non
 
     # H3 and Section 5.4.
     order_d: dict[tuple[int, int], Interval] = {}
+    arm_t: dict[tuple[int, int], tuple[float, float]] = {}
     for cell in CELLS:
         prefix, exact = pass_of(f"T{cell[0]}", cell, "prefix"), pass_of(f"T{cell[0]}", cell, "exact")
         if prefix is not None and exact is not None:
             order_d[cell] = boot([prefix, exact], _difference)
-    h3 = h3_verdict(order_d)
+            arm_t[cell] = (float(exact.mean()), float(prefix.mean()))
+    h3 = h3_verdict(order_d, arm_t)
     h3["differences"] = order_d
     section_5_4 = failed_h1_reading(h1, arm_r.get(H1_CELL), d.get(H1_CELL))
 
