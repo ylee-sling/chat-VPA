@@ -80,3 +80,18 @@ H2 and "near the floor" in the reading of a failed H1 are decided; how many slot
 confidence orders reveal per pass. One fact worth a sentence in Section 3.1: with the cosine schedule the passes
 are unequal, so at (16, 4) the last pass decides 6 of the 16 slots and at (32, 2) the last pass decides 22 of 32
 (*computed*), while the bound (10) is stated in the largest number per pass, not in the mean g = B/K.
+
+## 7. E0 has been measured, and E1 leaves the protocol (25 November 2026)
+
+Not an error of the draft, but its next revision cannot keep three of its statements:
+
+- "No Chat-VPA measurement exists yet" (abstract, Section 6). E0 is measured at B = 16 (`docs/e0.md`,
+  Section 10): Table 5's cells at (16, 4) and (16, 2) can be filled for both arms, and the cells at (32, 4) and
+  (32, 2) read "not run" (the author's decision, `docs/e0.md`, Section 9), not "---".
+- H1 clearly fails (rho = 0.019 [0.000, 0.047] against 0.5). Section 6.4 says what a failed H1 means; by that
+  reading the student of Sections 4 and 5 is not trained, so the 858 MB budget and the roofline predictions
+  describe a model that this project does not build next.
+- The experiments that the draft plans after E0 are not the project's next experiments. From E1 on the
+  question is exact, verified drafting on the released `google/gemma-4-E2B-it` (`docs/e1.md`), which the draft
+  does not describe. What becomes of the manuscript (a revision that reports E0 and changes direction, or a new
+  manuscript for E1) is the author's decision and is not made here.

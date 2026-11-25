@@ -15,8 +15,16 @@ autoregressive teacher.
 ## Status
 
 > [!IMPORTANT]
-> **Nothing of Chat-VPA has been measured.** No Block-DFM model has been trained, and this repository holds no
-> result of the method.
+> **The first experiment, E0, is closed with a negative result** (branch `e0`, measured on one NVIDIA L4, 24 to
+> 25 November 2026; [`docs/e0.md`](docs/e0.md), Section 10). Block-DFM on the frozen Gemma 4 E2B, with 16-token
+> blocks in 4 passes and the exact kernel, reaches Pass@1 0.4% [0.0, 1.1] on MBPP validation against 23.8% for the
+> autoregressive baseline (ratio 0.019 [0.000, 0.047]): the pre-registered hypothesis H1 clearly fails, and by
+> the protocol's own rule the preprint's student model is not trained. The runs with 32-token blocks were not run
+> (the author's decision of 25 November 2026). One seed, Python only, 450 samples per cell.
+>
+> **From E1 on the project asks another question** ([`docs/e1.md`](docs/e1.md), a draft pre-registration): can a
+> drafter whose tokens the frozen `google/gemma-4-E2B-it` verifies exactly produce the model's own text faster
+> than the model alone and than the drafter Google ships for it? Nothing of E1 has been measured.
 
 What exists today:
 
@@ -29,7 +37,7 @@ What exists today:
   what was changed and what was dropped.
 - **Its tests:** 103 imported tests and 2 guards of the import pass on CPU with Python 3.12 and 3.13; among
   them, the realizer reproduces transformers' `Gemma4ForCausalLM` under causal masks on a tiny random model.
-- **On branch `e0`, the Block-DFM core** (not on `main` yet): the staircase, fused and window masks; the fused
+- **On branch `e0`, the Block-DFM core, E0's pipeline and E1's Step 0** (not on `main` yet). The core: the staircase, fused and window masks; the fused
   commit; the block sampler with the exact kernel, the prefix-growing and the confidence orders and a pass
   audit; the staircase training pass and the block loss; batched autoregressive rollouts as training targets.
   Its tests check the masks against an explicit loop over the preprint's Eq. 5, the training pass against the
@@ -37,19 +45,21 @@ What exists today:
   backbone's, one block spanning the canvas against the whole-canvas sampler, and a causal window against
   `generate`. These tests verify the implementation, not the method.
 
-The numbers that motivate the design are measurements of the predecessor (text-VPA's `docs/stage0.md` and
-`docs/stage1.md`), not of this code.
+The numbers that motivated the design are measurements of the predecessor (text-VPA's `docs/stage0.md` and
+`docs/stage1.md`); E0's are this code's.
 
 ## Next
 
-The first experiment is **E0**, the bridge experiment of the preprint's Sec. 6.2: Block-DFM on the frozen
-Gemma 4 E2B, trained under the staircase block-causal mask on human references or on the backbone's own
-autoregressive rollouts, evaluated on MBPP's validation split. Its pre-registration is
-[`docs/e0.md`](docs/e0.md) on branch `e0`, confirmed by the author except C6, the data; no training starts before
-C6 is decided. Three checks on the L4 came first (`bash scripts/ncp/first_checks.sh`, then
-`bash scripts/ncp/first_checks.sh show`): the ported code against the predecessor's samples (identical, 450 of
-450 in all three paths), the throughput of autoregressive rollouts, and the block machinery on the real weights.
-What the preprint draft is known to get wrong is listed in
+**E1, Step 0** trains nothing ([`docs/e1.md`](docs/e1.md), Section 3): the released Gemma 4 E2B-it decoding
+alone, with Google's Multi-Token Prediction drafter and with prompt lookup, in Hugging Face Transformers and in
+LiteRT-LM; the time of one target pass over n positions and the ceiling it sets for any drafter on a device; and
+E0's two checkpoints as block drafters that the frozen backbone verifies. On the server:
+`bash scripts/ncp/e1_setup.sh` (downloads, two further runtimes in environments of their own, a preflight), then
+`bash scripts/ncp/e1_step0.sh`. The open choices and reading rules of `docs/e1.md` are the author's to confirm
+before a number is read.
+
+E0's record: its pre-registration, the checks before the run, the decisions and the result are in
+[`docs/e0.md`](docs/e0.md). What the preprint draft is known to get wrong is listed in
 [`docs/preprint-corrections.md`](docs/preprint-corrections.md).
 
 ## Install and test
