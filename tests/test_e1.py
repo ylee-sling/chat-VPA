@@ -400,3 +400,34 @@ def test_the_preflight_reads_both_checkpoints_and_decodes(tiny, capsys):
     tokenizer.save_pretrained(other)
     assert pf.main(["--model", str(other), *args[2:]]) == 1
     assert "UNEXPECTED: the rendered prompt mentions thinking" in capsys.readouterr().out
+
+
+def test_every_command_resolves_its_device_from_auto_by_default(monkeypatch, tmp_path):
+    """Without --device each command asks chat_vpa.device for "auto" (cuda, then mps, then cpu), as every other
+    command of the repository does; None reached torch.device on the server and stopped the preflight."""
+    import chat_vpa.device
+    from chat_vpa import e1_bridge, e1_ceiling, e1_decode, e1_preflight
+
+    asked: list[object] = []
+
+    class Resolved(Exception):
+        pass
+
+    def record(name="auto"):
+        asked.append(name)
+        raise Resolved
+
+    monkeypatch.setattr(chat_vpa.device, "resolve_device", record)
+    some = str(tmp_path / "unused")
+    commands = [
+        (e1_bridge, ["--model", some, "--checkpoint", some, "--eval-dir", some, "--out", some]),
+        (e1_ceiling, ["--model", some, "--prompts", some, "--out", some]),
+        (e1_decode, ["--model", some, "--prompts", some, "--out", some]),
+        (e1_preflight, ["--model", some, "--assistant", some, "--prompts", some]),
+    ]
+    for module, argv in commands:
+        with pytest.raises(Resolved):
+            module.main(argv)
+    assert asked == ["auto"] * len(commands)
+    monkeypatch.undo()
+    assert isinstance(chat_vpa.device.resolve_device("auto"), torch.device)

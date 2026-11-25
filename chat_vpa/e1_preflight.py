@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dtype", default="bf16", choices=sorted(DTYPES))
     p.add_argument("--smoke-prompts", type=int, default=3)
     p.add_argument("--smoke-tokens", type=int, default=48)
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default="auto", help="auto: cuda, then mps, then cpu (chat_vpa.device)")
     args = p.parse_args(argv)
 
     import transformers

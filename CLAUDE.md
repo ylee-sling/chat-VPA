@@ -56,8 +56,9 @@ B = 32 runs are not run (Section 9).
 | `chat_vpa/e1_ceiling.py` | | the time of one target pass over n positions, the ceiling n t(1) / t(n), the predicted speed-up of a free drafter at acceptance alpha; where a pass over n tokens and n passes choose different tokens |
 | `chat_vpa/e1_bridge.py` | | E0's checkpoints as block drafters under greedy verification along the backbone's greedy continuation: accepted tokens per cycle, tokens per backbone pass (passes counted, not timed); the committed-stream check |
 | `chat_vpa/e1_litert.py` | | Step 0 in LiteRT-LM (its own environment, no torch): speculative decoding off, on, adaptive at lenience 0; a mode that cannot start is recorded and the others are measured |
+| `chat_vpa/e1_vllm.py` | | Step 0 in vLLM (its own environment): `run` one arm (`off` or `mtp:G`, Google's drafter through vLLM's Gemma 4 MTP path) per engine and process, `summarize` the arms against `off-1` (with `off-2` as the drift check), `smoke` for the preflight |
 | `chat_vpa/e1_preflight.py`, `e1_report.py` | | the downloaded target and drafter against what Step 0 assumes, with a smoke decode; Step 0's tables as they stand (reads no rule) |
-| `scripts/ncp/e1_setup.sh`, `e1_step0.sh` | | E1's downloads, the three environments and the preflight (`show` prints what the author pastes back); Step 0's four parts in tmux, each skipped once done (`show`: the tables) |
+| `scripts/ncp/e1_setup.sh`, `e1_step0.sh` | | E1's downloads, the three environments and the preflight (`show` prints what the author pastes back); Step 0's five parts in tmux (bridge, ceiling, decode, litert, vllm), each skipped once done (`show`: the tables) |
 | `docs/e1.md` | | the pre-registration of E1 (Step 0 confirmed and frozen, 25 November 2026): the question and the author's decisions, setup and preflight, Step 0's measurements and timing rules, reading rules R1 to R5, choices C1 to C11; Step 1 as a sketch with A3's design (D1 to D8, its oracle and break-even gates) and the prior work on block latents; what could not be tested off the server |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
@@ -237,6 +238,12 @@ C9).
   greedy (C1 and C2, confirmed 25 November 2026).
 - **LiteRT-LM** is driven through its Python interface with lenience 0 passed explicitly and the sampler at
   top-k 1; one engine per mode, created up front.
+- **vLLM** runs one engine per arm, each in its own process, in the order off, mtp:2, mtp:4, mtp:6, mtp:8, off;
+  speed-ups are against `off-1`, and `off-2` measures the drift (R2 is not read for the table if its interval
+  excludes 1). Prefix caching off, `language_model_only`, request statistics on, CUDA graphs and compilation as
+  vLLM's defaults, prompts as the token ids of `chat_ids` (`docs/e1.md`, Section 3.4).
+- **Every command that takes a device defaults to `auto`** (`chat_vpa.device`): None reached `torch.device` in the
+  first server preflight; `tests/test_e1.py` runs each E1 command without `--device`.
 - **The IFEval checker is run with `random.seed(0)` and `langdetect.DetectorFactory.seed = 0`**: as shipped, two
   runs on the same responses differ by a prompt or two (`docs/e1.md`, Section 2).
 - **In bfloat16 the model's own `generate` and this repository's realizer path can choose different tokens**

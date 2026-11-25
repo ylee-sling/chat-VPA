@@ -8,9 +8,9 @@ measurements wrote.
 
 It prints, for every measurement found under OUT, where it ran (device, precision, runtime, threads) and its
 table: ``bridge/<run>`` (``e1_bridge.py``), ``ceiling/<tag>`` (``e1_ceiling.py``), ``decode/<tag>`` and
-``decode/<tag>/profile`` (``e1_decode.py``), ``litert/<tag>`` (``e1_litert.py``). It computes nothing new and
-reads no rule: Step 0's reading rules are applied by hand from docs/e1.md, Section 4, until the author has
-confirmed them.
+``decode/<tag>/profile`` (``e1_decode.py``), ``litert/<tag>`` (``e1_litert.py``), ``vllm/<tag>``
+(``e1_vllm.py``). It computes nothing new and reads no rule: the reading rules of docs/e1.md, Section 4, are
+applied by hand to these tables.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from chat_vpa import e1_bridge, e1_ceiling, e1_decode, e1_litert
+from chat_vpa import e1_bridge, e1_ceiling, e1_decode, e1_litert, e1_vllm
 
 __all__ = ["render"]
 
@@ -94,6 +94,33 @@ def render(out: Path) -> str:
                 lines.append(f"- {mode}: {len(where)} responses differ from `off`'s; first differing character at "
                              f"{where[:10]}{' ...' if len(where) > 10 else ''}; the same number of tokens as `off` "
                              f"in {m['same_token_count']} of {m['prompts']}")
+    for path in sorted(out.glob("vllm/*/summary.json")):
+        s = json.loads(path.read_text())
+        found = True
+        startup = ", ".join(f"{tag} {seconds:.0f} s" for tag, seconds in s["startup_seconds"].items())
+        lines += ["", f"## vLLM: {path.parent.name}", "",
+                  _where(s["environment"]) + f"; {s['prompts']['count']} prompts, up to {s['max_new_tokens']} new "
+                  f"tokens, greedy, one request at a time; one engine per arm, run in the order "
+                  f"{', '.join(s['order'])} (engine start-up: {startup}).", "", e1_vllm._markdown(s["arms"])]
+        drift = s["arms"].get("off-2")
+        if drift is None:
+            lines.append("- No second reference run (off-2): the drift of the machine over the run is not known.")
+        else:
+            low, high = drift["decode_speedup_interval"]
+            verdict = ("contains 1: the machine held its speed" if low <= 1 <= high else
+                       "excludes 1: the machine's speed moved during the run, and R2 is not read for this table "
+                       "(docs/e1.md, Section 3.4)")
+            lines.append(f"- Drift: off-2's decode speed against off-1's is {drift['decode_speedup']:.3f} "
+                         f"[{low:.3f}, {high:.3f}], which {verdict}; off-2 has the same tokens as off-1 on "
+                         f"{drift['same_tokens']} of {drift['prompts']} prompts.")
+        for tag, m in s["arms"].items():
+            if m["acceptance_histogram"]:
+                lines.append(f"- {tag}: verification steps by accepted draft tokens (0, 1, ...): "
+                             f"{m['acceptance_histogram']}")
+            if m["first_differences"]:
+                where = sorted(m["first_differences"].values())
+                lines.append(f"- {tag}: {len(where)} responses differ from off-1's; first differing token at "
+                             f"{where[:10]}{' ...' if len(where) > 10 else ''}")
     if not found:
         lines += ["", "Nothing has been measured yet."]
     return "\n".join(lines) + "\n"

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 SLING AI Inc.
 #
-# e1_step0.sh -- E1's Step 0 (docs/e1.md, Section 3): four measurements, nothing trained.
+# e1_step0.sh -- E1's Step 0 (docs/e1.md, Section 3): five measurements, nothing trained.
 #
 #   bash scripts/ncp/e1_step0.sh           all parts, one after another, in tmux (session e1-step0)
 #   bash scripts/ncp/e1_step0.sh run       the same in the foreground
@@ -18,29 +18,32 @@
 #   litert    the same prompts in LiteRT-LM, Google's on-device runtime, with its build of the model: speculative
 #             decoding off, on and adaptive (chat_vpa/e1_litert.py, in LiteRT-LM's own environment), on the CPU
 #             with THREADS threads and, if the runtime can use it, on the GPU
+#   vllm      the same prompts in vLLM on the GPU, alone and with Google's drafter at draft lengths 2, 4, 6, 8
+#             (chat_vpa/e1_vllm.py, in vLLM's own environment): one engine and one process per arm, the
+#             reference first and again last (off-1, off-2: the drift of the machine), then a summary
 #
 # A part that has finished is skipped (its .done marker), so the script can be run again after a failure. Some
 # runs may not be possible on this machine: float32 on the GPU may not fit the L4's memory, float32 on the CPU
 # needs about 20 GiB of RAM (it is skipped when less than CPU_FP32_GIB is available, so that an out-of-memory kill
 # cannot take another process with it), and LiteRT-LM's GPU backend needs a driver it can use. A failure or a skip
-# there is logged and the script goes on. The vLLM arm of Step 0 is separate (docs/e1.md, Section 3.4): it is
-# written after the preflight has shown the installed version's flags.
+# there is logged and the script goes on; so is a vLLM arm that fails, since vLLM is the newest runtime here.
 #
 # Variables (defaults in brackets):
-#   PARTS ["bridge ceiling decode litert"]   OUT [runs/e1-step0]   ASSETS [runs/assets]   THREADS [4]
+#   PARTS ["bridge ceiling decode litert vllm"]   OUT [runs/e1-step0]   ASSETS [runs/assets]   THREADS [4]
 #   DECODE_PROMPTS [100]  MAX_NEW [256]  ARMS ["ar mtp:2 mtp:4 mtp:6 mtp:8 lookup:10"]
 #   FP32_PROMPTS [50]     CPU_PROMPTS [20]  CPU_MAX_NEW [128]  CPU_ARMS ["ar mtp:2 mtp:4"]
 #   CEILING_PROMPTS [20]  CPU_CEILING_PROMPTS [5]  LITERT_PROMPTS [50]  LITERT_BACKENDS ["cpu gpu"]
 #   CPU_FP32_GIB [24]     free memory (MemAvailable, GiB) below which the float32 runs on the CPU are skipped
-#   EXTRA_BRIDGE [], EXTRA_DECODE [], EXTRA_CEILING [], EXTRA_LITERT [] (dry runs)
+#   VLLM_PROMPTS [100]    VLLM_ARMS ["off mtp:2 mtp:4 mtp:6 mtp:8 off"]   VLLM_TIMEOUT [7200] seconds per arm
+#   EXTRA_BRIDGE [], EXTRA_DECODE [], EXTRA_CEILING [], EXTRA_LITERT [], EXTRA_VLLM [] (dry runs)
 # Never shuts the server down. Do not git pull while it runs.
 set -euo pipefail
-PASS_VARS="PARTS OUT ASSETS THREADS DECODE_PROMPTS MAX_NEW ARMS FP32_PROMPTS CPU_PROMPTS CPU_MAX_NEW CPU_ARMS CEILING_PROMPTS CPU_CEILING_PROMPTS LITERT_PROMPTS LITERT_BACKENDS CPU_FP32_GIB EXTRA_BRIDGE EXTRA_DECODE EXTRA_CEILING EXTRA_LITERT SESSION"
+PASS_VARS="PARTS OUT ASSETS THREADS DECODE_PROMPTS MAX_NEW ARMS FP32_PROMPTS CPU_PROMPTS CPU_MAX_NEW CPU_ARMS CEILING_PROMPTS CPU_CEILING_PROMPTS LITERT_PROMPTS LITERT_BACKENDS CPU_FP32_GIB VLLM_PROMPTS VLLM_ARMS VLLM_TIMEOUT EXTRA_BRIDGE EXTRA_DECODE EXTRA_CEILING EXTRA_LITERT EXTRA_VLLM SESSION"
 # shellcheck source=scripts/ncp/env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
 ACTION="${1:-launch}"
-PARTS="${PARTS:-bridge ceiling decode litert}"
+PARTS="${PARTS:-bridge ceiling decode litert vllm}"
 OUT="$(runs_dir "${OUT:-runs/e1-step0}")"
 ASSETS="$(runs_dir "${ASSETS:-runs/assets}")"
 THREADS="${THREADS:-4}"
@@ -61,6 +64,11 @@ LITERT_BACKENDS="${LITERT_BACKENDS:-cpu gpu}"
 CPU_FP32_GIB="${CPU_FP32_GIB:-24}"
 EXTRA_LITERT="${EXTRA_LITERT:-}"
 LITERT_PY="$ASSETS/venvs/litert/bin/python"
+VLLM_PROMPTS="${VLLM_PROMPTS:-100}"
+VLLM_ARMS="${VLLM_ARMS:-off mtp:2 mtp:4 mtp:6 mtp:8 off}"
+EXTRA_VLLM="${EXTRA_VLLM:-}"
+VLLM_TIMEOUT="${VLLM_TIMEOUT:-7200}"
+VLLM_PY="$ASSETS/venvs/vllm/bin/python"
 LITERT_MODEL="$ASSETS/litert/gemma-4-E2B-it.litertlm"
 SESSION="${SESSION:-e1-step0}"
 IT_MODEL="$ASSETS/models/gemma-4-E2B-it"
@@ -156,22 +164,53 @@ decode() {
   fi
 }
 
-# LiteRT-LM runs in its own environment, with a home of its own under runs/ (a runtime may keep caches there).
+# foreign <command...>: a runtime of another environment, with a home of its own under runs/ (so that what it
+# caches stays inside runs/) and without usage reports; vLLM keeps its own CUDA allocator settings.
+foreign() {
+  mkdir -p "$ASSETS/home"
+  env -u PYTORCH_CUDA_ALLOC_CONF HOME="$ASSETS/home" XDG_CACHE_HOME="$ASSETS/home/.cache" \
+    XDG_CONFIG_HOME="$ASSETS/home/.config" VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 "$@"
+}
+
+# LiteRT-LM runs in its own environment.
 litert() {
   if [[ ! -x "$LITERT_PY" || ! -s "$LITERT_MODEL" ]]; then
     log "LiteRT-LM is not set up ($LITERT_PY, $LITERT_MODEL): skipping (bash scripts/ncp/e1_setup.sh)"
     return 0
   fi
-  mkdir -p "$ASSETS/home"
   local backend
   for backend in $LITERT_BACKENDS; do
     local threads=()
     if [[ "$backend" == cpu ]]; then threads=(--threads "$THREADS"); fi
     # shellcheck disable=SC2086
-    step "$OUT/litert/$backend" soft env HOME="$ASSETS/home" XDG_CACHE_HOME="$ASSETS/home/.cache" "$LITERT_PY" \
+    step "$OUT/litert/$backend" soft foreign "$LITERT_PY" \
       -m chat_vpa.e1_litert --model "$LITERT_MODEL" --prompts "$PROMPTS" --limit "$LITERT_PROMPTS" \
       --max-new-tokens "$MAX_NEW" --backend "$backend" "${threads[@]}" --out "$OUT/litert/$backend" $EXTRA_LITERT
   done
+}
+
+# vLLM runs in its own environment, on the GPU only: one process per arm, then the summary (in this environment).
+vllm() {
+  if [[ "$REQUIRE_GPU" != 1 ]]; then log "vLLM needs the GPU: skipped in a dry run"; return 0; fi
+  if [[ ! -x "$VLLM_PY" ]]; then
+    log "vLLM is not set up ($VLLM_PY): skipping (bash scripts/ncp/e1_setup.sh)"
+    return 0
+  fi
+  local dir="$OUT/vllm/gpu-bf16" arm tag offs=0
+  for arm in $VLLM_ARMS; do
+    # The names of e1_vllm.tag_of: off-1, off-2, ... for the repeated reference, mtp-G for an arm mtp:G.
+    if [[ "$arm" == off ]]; then offs=$((offs + 1)); tag="off-$offs"; else tag="${arm/:/-}"; fi
+    # shellcheck disable=SC2086
+    # An arm takes minutes; the timeout only keeps a hung engine from holding the GPU unattended.
+    step "$dir/arms/$tag" soft foreign timeout --kill-after=60 "$VLLM_TIMEOUT" "$VLLM_PY" -m chat_vpa.e1_vllm run \
+      --arm "$arm" --tag "$tag" --model "$IT_MODEL" --assistant "$DRAFTER" --prompts "$PROMPTS" --limit "$VLLM_PROMPTS" \
+      --max-new-tokens "$MAX_NEW" --out "$dir" $EXTRA_VLLM
+  done
+  if [[ -f "$dir/arms/off-1/.done" ]]; then
+    "$PY" -m chat_vpa.e1_vllm summarize --out "$dir" || log "FAILED, going on: the summary of the vLLM arms"
+  else
+    log "no finished off-1: the vLLM arms are not summarized"
+  fi
 }
 
 run() {
@@ -183,8 +222,8 @@ run() {
   local part
   for part in $PARTS; do
     case "$part" in
-      bridge|ceiling|decode|litert) log "== $part"; "$part" ;;
-      *) die "PARTS holds '$part'; the parts are bridge, ceiling, decode, litert" ;;
+      bridge|ceiling|decode|litert|vllm) log "== $part"; "$part" ;;
+      *) die "PARTS holds '$part'; the parts are bridge, ceiling, decode, litert, vllm" ;;
     esac
   done
   REQUIRE_GPU=0 "$PY" -m chat_vpa.e1_report --out "$OUT" > /dev/null

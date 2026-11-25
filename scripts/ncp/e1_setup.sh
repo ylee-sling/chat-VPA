@@ -230,6 +230,14 @@ preflight() {
       apart "$vllm/python" -c "import torch, vllm; print('  vllm', vllm.__version__, '/ torch', torch.__version__, '/ CUDA', torch.cuda.is_available())" 2>&1 | tail -n 1
       apart "$vllm/vllm" serve --help=all 2>/dev/null | grep -i -A 6 -- "--speculative-config" | head -n 14 \
         || apart "$vllm/vllm" serve --help 2>/dev/null | grep -i -A 6 "speculative" | head -n 14 || echo "  no --speculative-config in the help"
+      echo "-- a smoke decode with Google's drafter (mtp:4, the first prompt, 32 tokens): a check, not a result"
+      if [[ "$REQUIRE_GPU" != 1 ]]; then
+        echo "  skipped: no GPU in a dry run"
+      elif ! apart timeout 1200 env -u PYTORCH_CUDA_ALLOC_CONF VLLM_LOGGING_LEVEL=WARNING "$vllm/python" -m chat_vpa.e1_vllm smoke \
+          --model "$IT_MODEL" --assistant "$DRAFTER" --prompts "$PROMPTS" 2> "$ASSETS/vllm-smoke.log"; then
+        echo "UNEXPECTED: the vLLM smoke decode failed; the last lines of runs/assets/vllm-smoke.log:"
+        tail -n 25 "$ASSETS/vllm-smoke.log" | sed 's/^/    /'
+      fi
     else
       echo "  not installed (bash scripts/ncp/e1_setup.sh runtimes)"
     fi

@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dtype", default="bf16", choices=sorted(DTYPES))
     p.add_argument("--threads", type=int, default=None, help="CPU threads (CPU runs)")
     p.add_argument("--profile", action="store_true", help="time every pass (never used for a speed-up)")
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default="auto", help="auto: cuda, then mps, then cpu (chat_vpa.device)")
     args = p.parse_args(argv)
     arms = [parse_arm(a) for a in args.arms]
     if arms[0].kind != "ar" or len({a.name for a in arms}) != len(arms):

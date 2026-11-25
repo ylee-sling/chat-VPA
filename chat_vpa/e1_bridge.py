@@ -220,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--check", type=int, default=10, help="problems of the committed-stream check (0: skip)")
     p.add_argument("--dtype", default="bf16", choices=sorted(DTYPES), help="bf16: E0's precision; fp32: float32")
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default="auto", help="auto: cuda, then mps, then cpu (chat_vpa.device)")
     args = p.parse_args(argv)
 
     from chat_vpa.backbone import RealizerSpec, Stage0Realizer, load_gemma4

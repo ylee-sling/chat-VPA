@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--warmup", type=int, default=2, help="prompts measured first and thrown away")
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
     p.add_argument("--threads", type=int, default=None, help="CPU threads (CPU runs)")
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default="auto", help="auto: cuda, then mps, then cpu (chat_vpa.device)")
     args = p.parse_args(argv)
     if 1 not in args.lengths or min(args.lengths) < 1:
         raise SystemExit("--lengths must be positive and include 1")
