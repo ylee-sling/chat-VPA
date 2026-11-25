@@ -80,6 +80,10 @@ def render(out: Path) -> str:
         found = True
         env = s["environment"]
         threads = f", {env['cpu_threads']} of {env['cpus']} CPU threads" if env["backend"] == "cpu" else ""
+        if env["backend"] == "gpu":
+            driver = env.get("vulkan_driver_files")
+            threads = (f", Vulkan driver {driver} only" if driver else
+                       ", every installed Vulkan driver visible (check that the row ran on the GPU)")
         lines += ["", f"## LiteRT-LM: {path.parent.name}", "",
                   f"{env['runtime']}, backend {env['backend']}{threads}, {env['machine']}, {env['time']}; "
                   f"{s['model']['file']} ({s['model']['bytes'] / 2**30:.2f} GiB; drafter inside: "

@@ -273,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         "what": "greedy decoding of the development prompts in LiteRT-LM, measured (docs/e1.md, Section 3.4)",
         "environment": {"runtime": f"LiteRT-LM {_runtime_version()}", "backend": args.backend,
                         "cpu_threads": args.threads, "cpus": os.cpu_count(), "machine": platform.machine(),
+                        "vulkan_driver_files": os.environ.get("VK_DRIVER_FILES"),
                         "time": time.strftime("%Y-%m-%d %H:%M:%S %Z")},
         "model": {"file": args.model.name, "bytes": args.model.stat().st_size, "sha256": file_sha256(args.model),
                   **facts},

@@ -10,7 +10,8 @@ is known to get wrong (the "two tokens per pass" reading of K = 128, the finishe
 Table 5): do not repeat those statements, and do not edit the preprint unasked.
 
 **Status: E0 is closed at B = 16 with a negative result; E1's Step 0 is built, confirmed by the author (C1 to
-C11 and R1 to R5, 25 November 2026) and frozen, and waits for the server (`docs/e1.md`). Step 1 is a sketch; its
+C11 and R1 to R5, 25 November 2026) and frozen, and was started on the server on 26 November 2026
+(`docs/e1.md`; no Step 0 number is in the repository yet). Step 1 is a sketch; its
 arm A3 is the author's block-latent drafter (`docs/e1.md`, Section 6.1, with the 2026 prior work in 6.2).** E1 leaves
 the preprint's protocol by the author's decision of 25 November 2026: drafting that the frozen
 `google/gemma-4-E2B-it` verifies exactly, measured against Google's own drafter for it; for E1, `docs/e1.md`

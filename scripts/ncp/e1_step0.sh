@@ -178,12 +178,24 @@ litert() {
     log "LiteRT-LM is not set up ($LITERT_PY, $LITERT_MODEL): skipping (bash scripts/ncp/e1_setup.sh)"
     return 0
   fi
-  local backend
+  local backend icd
   for backend in $LITERT_BACKENDS; do
-    local threads=()
+    local threads=() vulkan=()
     if [[ "$backend" == cpu ]]; then threads=(--threads "$THREADS"); fi
+    if [[ "$backend" == gpu ]]; then
+      # The GPU backend is WebGPU over Vulkan. Mesa's software renderer (lvp) may be installed beside the GPU's
+      # driver; shown only NVIDIA's, the loader cannot fall back to the CPU and call it the GPU.
+      for icd in /etc/vulkan/icd.d/nvidia_icd.json /usr/share/vulkan/icd.d/nvidia_icd.json; do
+        if [[ -f "$icd" ]]; then vulkan=(VK_DRIVER_FILES="$icd" VK_ICD_FILENAMES="$icd"); break; fi
+      done
+      if [[ ${#vulkan[@]} -gt 0 ]]; then
+        log "LiteRT-LM's GPU backend sees one Vulkan driver: $icd"
+      else
+        log "no NVIDIA Vulkan driver file found: LiteRT-LM's GPU backend chooses among all installed drivers"
+      fi
+    fi
     # shellcheck disable=SC2086
-    step "$OUT/litert/$backend" soft foreign "$LITERT_PY" \
+    step "$OUT/litert/$backend" soft foreign env "${vulkan[@]}" "$LITERT_PY" \
       -m chat_vpa.e1_litert --model "$LITERT_MODEL" --prompts "$PROMPTS" --limit "$LITERT_PROMPTS" \
       --max-new-tokens "$MAX_NEW" --backend "$backend" "${threads[@]}" --out "$OUT/litert/$backend" $EXTRA_LITERT
   done

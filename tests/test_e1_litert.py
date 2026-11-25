@@ -216,6 +216,7 @@ def test_the_command_measures_the_modes_that_start_and_records_the_one_that_does
     prompts = tmp_path / "dev.jsonl"
     prompts.write_text("".join(json.dumps(row) + "\n" for row in PROMPTS))
     out = tmp_path / "out"
+    monkeypatch.setenv("VK_DRIVER_FILES", "/x/nvidia_icd.json")
     assert lt.main(["--model", str(model), "--prompts", str(prompts), "--out", str(out), "--threads", "3",
                     "--max-new-tokens", "9", "--warmup", "1"]) == 0
     printed = capsys.readouterr().out
@@ -238,6 +239,7 @@ def test_the_command_measures_the_modes_that_start_and_records_the_one_that_does
     assert summary["modes"]["on"]["decode_speedup"] == pytest.approx(0.6 / 0.44)
     assert summary["modes"]["on"]["first_differences"] == {"p2": 6}
     assert summary["environment"]["backend"] == "cpu" and summary["environment"]["cpu_threads"] == 3
+    assert summary["environment"]["vulkan_driver_files"] == "/x/nvidia_icd.json"      # what the script showed it
     assert summary["model"]["speculative_decoding_support"] is True and summary["thinking"] == "off"
     assert summary["first_prompt_as_rendered"] == "<user>zero</user><model>"
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines()]
@@ -253,6 +255,17 @@ def test_the_command_measures_the_modes_that_start_and_records_the_one_that_does
     assert "- mode `adaptive` could not be started: RuntimeError: no engine for adaptive" in text
     assert "- on: 1 responses differ from `off`'s; first differing character at [6]" in text
     assert "Nothing has been measured yet." in e1_report.render(tmp_path / "empty")
+
+    # A GPU row names the one Vulkan driver it was shown, or says that it saw all of them.
+    gpu = json.loads((tmp_path / "step0" / "litert" / "cpu" / "summary.json").read_text())
+    gpu["environment"].update(backend="gpu", cpu_threads=None, vulkan_driver_files="/etc/vulkan/icd.d/nvidia_icd.json")
+    (tmp_path / "step0" / "litert" / "gpu").mkdir()
+    (tmp_path / "step0" / "litert" / "gpu" / "summary.json").write_text(json.dumps(gpu))
+    text = e1_report.render(tmp_path / "step0")
+    assert "## LiteRT-LM: gpu" in text and "backend gpu, Vulkan driver /etc/vulkan/icd.d/nvidia_icd.json only" in text
+    gpu["environment"]["vulkan_driver_files"] = None
+    (tmp_path / "step0" / "litert" / "gpu" / "summary.json").write_text(json.dumps(gpu))
+    assert "every installed Vulkan driver visible" in e1_report.render(tmp_path / "step0")
 
 
 def test_the_gpu_backend_and_a_file_without_thinking(tmp_path, monkeypatch):
