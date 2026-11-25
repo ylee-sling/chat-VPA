@@ -20,19 +20,22 @@
 #             with THREADS threads and, if the runtime can use it, on the GPU
 #
 # A part that has finished is skipped (its .done marker), so the script can be run again after a failure. Some
-# runs may not be possible on this machine: float32 on the GPU may not fit the L4's memory, and LiteRT-LM's GPU
-# backend needs a driver it can use. A failure there is logged and the script goes on. The vLLM arm of Step 0 is
-# separate (docs/e1.md, Section 3.4): it is written after the preflight has shown the installed version's flags.
+# runs may not be possible on this machine: float32 on the GPU may not fit the L4's memory, float32 on the CPU
+# needs about 20 GiB of RAM (it is skipped when less than CPU_FP32_GIB is available, so that an out-of-memory kill
+# cannot take another process with it), and LiteRT-LM's GPU backend needs a driver it can use. A failure or a skip
+# there is logged and the script goes on. The vLLM arm of Step 0 is separate (docs/e1.md, Section 3.4): it is
+# written after the preflight has shown the installed version's flags.
 #
 # Variables (defaults in brackets):
 #   PARTS ["bridge ceiling decode litert"]   OUT [runs/e1-step0]   ASSETS [runs/assets]   THREADS [4]
 #   DECODE_PROMPTS [100]  MAX_NEW [256]  ARMS ["ar mtp:2 mtp:4 mtp:6 mtp:8 lookup:10"]
 #   FP32_PROMPTS [50]     CPU_PROMPTS [20]  CPU_MAX_NEW [128]  CPU_ARMS ["ar mtp:2 mtp:4"]
 #   CEILING_PROMPTS [20]  CPU_CEILING_PROMPTS [5]  LITERT_PROMPTS [50]  LITERT_BACKENDS ["cpu gpu"]
+#   CPU_FP32_GIB [24]     free memory (MemAvailable, GiB) below which the float32 runs on the CPU are skipped
 #   EXTRA_BRIDGE [], EXTRA_DECODE [], EXTRA_CEILING [], EXTRA_LITERT [] (dry runs)
 # Never shuts the server down. Do not git pull while it runs.
 set -euo pipefail
-PASS_VARS="PARTS OUT ASSETS THREADS DECODE_PROMPTS MAX_NEW ARMS FP32_PROMPTS CPU_PROMPTS CPU_MAX_NEW CPU_ARMS CEILING_PROMPTS CPU_CEILING_PROMPTS LITERT_PROMPTS LITERT_BACKENDS EXTRA_BRIDGE EXTRA_DECODE EXTRA_CEILING EXTRA_LITERT SESSION"
+PASS_VARS="PARTS OUT ASSETS THREADS DECODE_PROMPTS MAX_NEW ARMS FP32_PROMPTS CPU_PROMPTS CPU_MAX_NEW CPU_ARMS CEILING_PROMPTS CPU_CEILING_PROMPTS LITERT_PROMPTS LITERT_BACKENDS CPU_FP32_GIB EXTRA_BRIDGE EXTRA_DECODE EXTRA_CEILING EXTRA_LITERT SESSION"
 # shellcheck source=scripts/ncp/env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
@@ -55,6 +58,7 @@ EXTRA_DECODE="${EXTRA_DECODE:-}"
 EXTRA_CEILING="${EXTRA_CEILING:-}"
 LITERT_PROMPTS="${LITERT_PROMPTS:-50}"
 LITERT_BACKENDS="${LITERT_BACKENDS:-cpu gpu}"
+CPU_FP32_GIB="${CPU_FP32_GIB:-24}"
 EXTRA_LITERT="${EXTRA_LITERT:-}"
 LITERT_PY="$ASSETS/venvs/litert/bin/python"
 LITERT_MODEL="$ASSETS/litert/gemma-4-E2B-it.litertlm"
@@ -80,10 +84,20 @@ step() {
     touch "$dir/.done"
     log "finished: ${dir#"$ROOT"/}"
   elif [[ "$mode" == soft ]]; then
-    log "FAILED, going on (float32 may not fit the GPU; LiteRT-LM may lack a GPU backend here): ${dir#"$ROOT"/}"
+    log "FAILED, going on (float32 may not fit the GPU or the RAM; LiteRT-LM may lack a GPU backend): ${dir#"$ROOT"/}"
   else
     die "failed: ${dir#"$ROOT"/}"
   fi
+}
+
+# memory_for_cpu_fp32: the machine has CPU_FP32_GIB GiB available now. The model in float32 is about 19 GiB
+# (5.1B parameters); a run that does not fit would be killed by the kernel, which may pick another process.
+memory_for_cpu_fp32() {
+  local have
+  have="$(awk '/^MemAvailable:/ {printf "%d", $2 / 1048576}' /proc/meminfo)"
+  if (( have >= CPU_FP32_GIB )); then return 0; fi
+  log "skipped, not run: float32 on the CPU needs about $CPU_FP32_GIB GiB of free memory, $have GiB are available"
+  return 1
 }
 
 bridge() {
@@ -110,10 +124,12 @@ ceiling() {
     # shellcheck disable=SC2086
     step "$OUT/ceiling/gpu-fp32" soft "$PY" -m chat_vpa.e1_ceiling --model "$IT_MODEL" --prompts "$PROMPTS" \
       --limit "$CEILING_PROMPTS" --dtype fp32 --out "$OUT/ceiling/gpu-fp32" $EXTRA_CEILING
-    # shellcheck disable=SC2086
-    step "$OUT/ceiling/cpu-fp32" hard "$PY" -m chat_vpa.e1_ceiling --model "$IT_MODEL" --prompts "$PROMPTS" \
-      --limit "$CPU_CEILING_PROMPTS" --repeats 3 --warmup 1 --device cpu --dtype fp32 --threads "$THREADS" \
-      --out "$OUT/ceiling/cpu-fp32" $EXTRA_CEILING
+    if memory_for_cpu_fp32; then
+      # shellcheck disable=SC2086
+      step "$OUT/ceiling/cpu-fp32" soft "$PY" -m chat_vpa.e1_ceiling --model "$IT_MODEL" --prompts "$PROMPTS" \
+        --limit "$CPU_CEILING_PROMPTS" --repeats 3 --warmup 1 --device cpu --dtype fp32 --threads "$THREADS" \
+        --out "$OUT/ceiling/cpu-fp32" $EXTRA_CEILING
+    fi
   fi
 }
 
@@ -131,10 +147,12 @@ decode() {
     step "$OUT/decode/gpu-fp32" soft "$PY" -m chat_vpa.e1_decode --model "$IT_MODEL" --assistant "$DRAFTER" \
       --prompts "$PROMPTS" --limit "$FP32_PROMPTS" --max-new-tokens "$MAX_NEW" --arms ar mtp:4 --dtype fp32 \
       --out "$OUT/decode/gpu-fp32" $EXTRA_DECODE
-    # shellcheck disable=SC2086
-    step "$OUT/decode/cpu-fp32" hard "$PY" -m chat_vpa.e1_decode --model "$IT_MODEL" --assistant "$DRAFTER" \
-      --prompts "$PROMPTS" --limit "$CPU_PROMPTS" --max-new-tokens "$CPU_MAX_NEW" --arms $CPU_ARMS --warmup 1 \
-      --device cpu --dtype fp32 --threads "$THREADS" --out "$OUT/decode/cpu-fp32" $EXTRA_DECODE
+    if memory_for_cpu_fp32; then
+      # shellcheck disable=SC2086
+      step "$OUT/decode/cpu-fp32" soft "$PY" -m chat_vpa.e1_decode --model "$IT_MODEL" --assistant "$DRAFTER" \
+        --prompts "$PROMPTS" --limit "$CPU_PROMPTS" --max-new-tokens "$CPU_MAX_NEW" --arms $CPU_ARMS --warmup 1 \
+        --device cpu --dtype fp32 --threads "$THREADS" --out "$OUT/decode/cpu-fp32" $EXTRA_DECODE
+    fi
   fi
 }
 

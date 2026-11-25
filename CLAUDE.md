@@ -9,8 +9,9 @@ before changing any math, and cite the equation in a comment. `docs/preprint-cor
 is known to get wrong (the "two tokens per pass" reading of K = 128, the finished latent oracle, two points of
 Table 5): do not repeat those statements, and do not edit the preprint unasked.
 
-**Status: E0 is closed at B = 16 with a negative result; E1's Step 0 is built and waits for the server
-(`docs/e1.md`, a draft: its open choices C1 to C11 and reading rules R1 to R5 are not yet confirmed).** E1 leaves
+**Status: E0 is closed at B = 16 with a negative result; E1's Step 0 is built, confirmed by the author (C1 to
+C11 and R1 to R5, 25 November 2026) and frozen, and waits for the server (`docs/e1.md`). Step 1 is a sketch; its
+arm A3 is the author's block-latent drafter (`docs/e1.md`, Section 6.1, with the 2026 prior work in 6.2).** E1 leaves
 the preprint's protocol by the author's decision of 25 November 2026: drafting that the frozen
 `google/gemma-4-E2B-it` verifies exactly, measured against Google's own drafter for it; for E1, `docs/e1.md`
 holds where it and the preprint disagree. The code on `main` is text-VPA's verified Stage 0
@@ -57,7 +58,7 @@ B = 32 runs are not run (Section 9).
 | `chat_vpa/e1_litert.py` | | Step 0 in LiteRT-LM (its own environment, no torch): speculative decoding off, on, adaptive at lenience 0; a mode that cannot start is recorded and the others are measured |
 | `chat_vpa/e1_preflight.py`, `e1_report.py` | | the downloaded target and drafter against what Step 0 assumes, with a smoke decode; Step 0's tables as they stand (reads no rule) |
 | `scripts/ncp/e1_setup.sh`, `e1_step0.sh` | | E1's downloads, the three environments and the preflight (`show` prints what the author pastes back); Step 0's four parts in tmux, each skipped once done (`show`: the tables) |
-| `docs/e1.md` | | the pre-registration of E1 (a draft): the question and the author's four decisions, setup and preflight, Step 0's measurements and timing rules, reading rules R1 to R5, open choices C1 to C11, Step 1 as a sketch, what could not be tested off the server |
+| `docs/e1.md` | | the pre-registration of E1 (Step 0 confirmed and frozen, 25 November 2026): the question and the author's decisions, setup and preflight, Step 0's measurements and timing rules, reading rules R1 to R5, choices C1 to C11; Step 1 as a sketch with A3's design (D1 to D8, its oracle and break-even gates) and the prior work on block latents; what could not be tested off the server |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
 | `docs/provenance.md` | | what was imported from text-VPA at `6f97346`, what changed, what was dropped; the corpus |
@@ -233,7 +234,7 @@ C9).
   another. Arms of a prompt run back to back; rates are ratios of sums over prompts; intervals are
   `e0_report.paired_bootstrap` over prompts. A profiled run is never used for a speed-up.
 - **The prompt** is one user turn in the model's chat template, no system prompt, thinking off; decoding is
-  greedy (open choices C1 and C2 until the author confirms them).
+  greedy (C1 and C2, confirmed 25 November 2026).
 - **LiteRT-LM** is driven through its Python interface with lenience 0 passed explicitly and the sampler at
   top-k 1; one engine per mode, created up front.
 - **The IFEval checker is run with `random.seed(0)` and `langdetect.DetectorFactory.seed = 0`**: as shipped, two
