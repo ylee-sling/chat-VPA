@@ -9,7 +9,11 @@ before changing any math, and cite the equation in a comment. `docs/preprint-cor
 is known to get wrong (the "two tokens per pass" reading of K = 128, the finished latent oracle, two points of
 Table 5): do not repeat those statements, and do not edit the preprint unasked.
 
-**Status: E0 is closed at B = 16 with a negative result; E1 is being prepared (`docs/e1.md`).** The code on `main` is text-VPA's verified Stage 0
+**Status: E0 is closed at B = 16 with a negative result; E1's Step 0 is built and waits for the server
+(`docs/e1.md`, a draft: its open choices C1 to C11 and reading rules R1 to R5 are not yet confirmed).** E1 leaves
+the preprint's protocol by the author's decision of 25 November 2026: drafting that the frozen
+`google/gemma-4-E2B-it` verifies exactly, measured against Google's own drafter for it; for E1, `docs/e1.md`
+holds where it and the preprint disagree. The code on `main` is text-VPA's verified Stage 0
 code (`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the
 Block-DFM core, its tests, the rollout generator and the checks for the L4 exist, and the checks have run (the port
 is exact: `docs/e0.md`, Section 2.4). The author has confirmed all of `docs/e0.md` (C1 to C12, 23 November 2026);
@@ -46,6 +50,14 @@ B = 32 runs are not run (Section 9).
 | `chat_vpa/e0_report.py` | Secs. 6.2, 6.4 | E0's report: the table of `docs/e0.md` Section 6 with paired-bootstrap intervals, H1, H2 (C10), H3 and the reading of a failed H1 (C11), Section 7's tables, and the deviations of any configuration from what Section 5 and C8 fix |
 | `chat_vpa/train_e0.py` | Secs. 3.3, 6.2, Eq. 12 | E0's trainer: text-VPA's Stage 0 loop with `collate_blocks`, `block_training_state` and `dfm_loss` behind its hooks; `RolloutData`, `EpochStream`; held-out L_DFM on both targets; checkpoints of stage `e0` (registers, the data's fingerprint), read by `block_evaluate` |
 | `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` (`inspect` runs `inspect_rollouts.py` on its output), `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back), `e0_data.sh` (`check`: batch 128 against 256; then the data), `e0_train.sh` (one run of T16, R16, T32, R32; `STOP_AT=100` for the timing), `e0_eval.sh` (a run's final checkpoint, 6 configurations; `report`), `e0_all.sh` (the four runs in C12's order: train, evaluate, report) |
+| `chat_vpa/e1_common.py`, `e1_prompts.py` | | E1's Step 0 (`docs/e1.md`, Section 3; not in the preprint): the released E2B-it for text, the chat prompt (one user turn, thinking off), the record of where a number was measured (torch imported lazily: `e1_litert.py` runs without it); the development prompts (the first qualifying first turns of UltraChat-200K `test_sft`) |
+| `chat_vpa/e1_decode.py` | | Step 0 in Transformers: greedy `generate` alone (`ar`), with Google's drafter (`mtp:G`) and with prompt lookup (`lookup:G`); passes counted with hooks; decode and end-to-end tok/s, tokens per cycle, exactness against `ar`, paired-bootstrap speed-ups; `--profile` |
+| `chat_vpa/e1_ceiling.py` | | the time of one target pass over n positions, the ceiling n t(1) / t(n), the predicted speed-up of a free drafter at acceptance alpha; where a pass over n tokens and n passes choose different tokens |
+| `chat_vpa/e1_bridge.py` | | E0's checkpoints as block drafters under greedy verification along the backbone's greedy continuation: accepted tokens per cycle, tokens per backbone pass (passes counted, not timed); the committed-stream check |
+| `chat_vpa/e1_litert.py` | | Step 0 in LiteRT-LM (its own environment, no torch): speculative decoding off, on, adaptive at lenience 0; a mode that cannot start is recorded and the others are measured |
+| `chat_vpa/e1_preflight.py`, `e1_report.py` | | the downloaded target and drafter against what Step 0 assumes, with a smoke decode; Step 0's tables as they stand (reads no rule) |
+| `scripts/ncp/e1_setup.sh`, `e1_step0.sh` | | E1's downloads, the three environments and the preflight (`show` prints what the author pastes back); Step 0's four parts in tmux, each skipped once done (`show`: the tables) |
+| `docs/e1.md` | | the pre-registration of E1 (a draft): the question and the author's four decisions, setup and preflight, Step 0's measurements and timing rules, reading rules R1 to R5, open choices C1 to C11, Step 1 as a sketch, what could not be tested off the server |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
 | `docs/provenance.md` | | what was imported from text-VPA at `6f97346`, what changed, what was dropped; the corpus |
@@ -63,7 +75,8 @@ ruff check .                            # must pass
 1. **Trustworthy over flattering.** Report failures, surprises and uncertainty plainly.
 2. **Rules before runs.** Decision rules are written in `docs/` before a run, and results are read by them.
 3. **Nothing is selected on a test set.** Diagnostics use MBPP's validation split (90 problems). HumanEval and
-   MBPP's test split stay untouched until a protocol run.
+   MBPP's test split stay untouched until a protocol run. In E1 everything is tuned on the development prompts
+   (`runs/assets/prompts/dev.jsonl`); IFEval has no development split and stays untouched until a protocol run.
 4. **One change per run** where possible (the predecessor's second Stage 0 run changed two things and their
    effects could not be separated).
 5. **Anything that conditions on the reference is labelled as such** and never reported as the method.
@@ -130,12 +143,17 @@ ruff check .                            # must pass
   it down or read `SHUTDOWN_ON_SUCCESS` / `SHUTDOWN_ON_FAILURE`.
 - **Python:** `~/text-VPA/.venv/bin/python` only (Python 3.12, torch 2.14.1+cu130, transformers 5.21.0). Do
   not create another environment. If a package is missing, add it to this environment and tell the author
-  which. Install nothing that pins another torch.
+  which. Install nothing that pins another torch. **One exception, the author's decision of 25 November 2026**
+  (`docs/e1.md`, Section 7): `scripts/ncp/e1_setup.sh` creates the environments of vLLM, LiteRT-LM and the IFEval
+  checker under `runs/assets/venvs/` (another torch stays inside vLLM's), downloads E1's assets to
+  `runs/assets/` and adds `pyarrow` to text-VPA's `.venv` if it is missing. Training and every PyTorch
+  measurement still run in text-VPA's `.venv`; a foreign runtime runs with its home under `runs/assets/home`.
 - The system Python 3.10 carries ROS 2 Humble: every script unsets `PYTHONPATH PYTHONHOME PYTHONSTARTUP
   VIRTUAL_ENV CONDA_PREFIX` and sets `PYTHONNOUSERSITE=1`; one-off commands run as
   `env -u PYTHONPATH ~/text-VPA/.venv/bin/python ...`.
 - `~/Vision-Predictor-Action` belongs to another project: never touch it.
-- This repository is cloned to `~/chat-VPA` and writes only under `~/chat-VPA/runs/`. Read only, where they
+- This repository is cloned to `~/chat-VPA` and writes only under `~/chat-VPA/runs/`. `runs/assets/` holds E1's
+  downloads and environments: it is not a run's output; never delete it with one. Read only, where they
   are: `~/text-VPA/data2/corpus`, `~/text-VPA/data2/eval`, `~/text-VPA/data2/models/gemma-4-E2B`, and the
   predecessor's runs under `~/text-VPA/runs/`.
 - One GPU job at a time: check `tmux ls` and `nvidia-smi` first. Long jobs run detached in tmux; tmux targets
@@ -204,3 +222,22 @@ C9).
 - **Checkpoints of an AR-shift model in bfloat16.** A cache built block by block equals the one-pass prefill up
   to rounding (float32: 1e-5 or less, tested; bfloat16: a few units in the last place), so a separate commit
   pass (ablation A10) gives the fused commit's samples in float32 and need not in bfloat16.
+
+### E1 (25 November 2026; `docs/e1.md` is E1's ground truth, the preprint has no section for it)
+
+- **The reference of every table is the released model's own decoding in that table's runtime and precision**
+  (`generate` with `do_sample=False`; LiteRT-LM's `off` mode). Verified arms go through the same call. Exactness
+  is token identity with that reference (LiteRT-LM: the same text), read per runtime and precision; "lossless" is
+  never said without both.
+- **A speed-up names its device, runtime, precision and thread count** and is never carried from one runtime to
+  another. Arms of a prompt run back to back; rates are ratios of sums over prompts; intervals are
+  `e0_report.paired_bootstrap` over prompts. A profiled run is never used for a speed-up.
+- **The prompt** is one user turn in the model's chat template, no system prompt, thinking off; decoding is
+  greedy (open choices C1 and C2 until the author confirms them).
+- **LiteRT-LM** is driven through its Python interface with lenience 0 passed explicitly and the sampler at
+  top-k 1; one engine per mode, created up front.
+- **The IFEval checker is run with `random.seed(0)` and `langdetect.DetectorFactory.seed = 0`**: as shipped, two
+  runs on the same responses differ by a prompt or two (`docs/e1.md`, Section 2).
+- **In bfloat16 the model's own `generate` and this repository's realizer path can choose different tokens**
+  (2 of 48 positions on the tests' tiny model; none in float32): a check of exact equality between two code
+  paths is made in float32, or its bfloat16 result is reported as a measurement.

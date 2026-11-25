@@ -6,9 +6,13 @@
 #
 #   * No script shuts the server down, and none reads SHUTDOWN_ON_SUCCESS / SHUTDOWN_ON_FAILURE (monthly plan).
 #   * One interpreter: text-VPA's .venv (Python 3.12). Nothing is installed by these scripts; a missing package
-#     stops the script with its name.
+#     stops the script with its name. The one exception, by the author's decision of 25 November 2026
+#     (docs/e1.md, Section 7), is e1_setup.sh: it downloads E1's assets and creates the environments of two other
+#     runtimes (vLLM, LiteRT-LM) and of the IFEval checker under runs/assets/, and adds pyarrow to text-VPA's
+#     .venv if it is missing. Training and every PyTorch measurement still use text-VPA's .venv only.
 #   * PYTHONPATH and friends are cleared: ROS 2 Humble's Python 3.10 paths must not reach Python 3.12.
-#   * Everything is written under <repository>/runs/. text-VPA's corpus, benchmarks, checkpoint and runs are
+#   * Everything is written under <repository>/runs/ (E1's downloads and environments: runs/assets/, which is
+#     not a run's output and is not deleted with one). text-VPA's corpus, benchmarks, checkpoint and runs are
 #     read where they are and never written.
 #   * One GPU job at a time: a script that needs the GPU refuses to start while another process holds its memory.
 #   * tmux targets are matched exactly ("=name"; a bare -t matches by prefix).

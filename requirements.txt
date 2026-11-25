@@ -4,3 +4,6 @@ torch==2.14.1
 transformers==5.21.0
 tokenizers==0.23.3
 numpy==2.5.3
+# E1's development prompts are read from UltraChat's parquet files (chat_vpa/e1_prompts.py). Not pinned: only the
+# parquet reader is used; on the server scripts/ncp/e1_setup.sh adds it to the environment if it is missing.
+pyarrow>=17
