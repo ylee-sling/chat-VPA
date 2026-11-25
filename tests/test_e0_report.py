@@ -228,9 +228,26 @@ def test_the_report_fills_the_table_and_reads_the_rules(tmp_path, capsys):
     assert er.main(args) == 0
     report = json.loads((out / "report.json").read_text())
     assert report["h1"]["status"] == "holds" and report["h1"]["rho"] == pytest.approx(60 / 107)
-    assert report["h2"]["status"] == "pending" and report["h3"]["status"] == "holds"
+    # E0 was stopped after R16 (docs/e0.md, Section 9): the B = 32 runs are "not run", and H2 is not read.
+    assert report["h2"]["status"] == "not read" and report["h3"]["status"] == "holds"
+    assert report["h2"]["text"] == ("(ii) and (iii) are not read: they need all four cells, and the B = 32 runs were "
+                                    "not run (docs/e0.md, Section 9); this is not a failed H2; (i) at the cells run: "
+                                    "(16, 4): holds, (16, 2): holds clearly")
+    # By hand: D(16, 4) comes from 2 problems and D(16, 2) from 4. A resample misses all of them with probability
+    # (88/90)^90 = 0.13 and (86/90)^90 = 0.017, so the interval's lower end is 0 for the first (not clear) and
+    # above 0 for the second (clear, below 2.5%).
     assert report["h2"]["repetition"]["16"]["status"] == "favours arm T"
-    assert report["h2"]["repetition"]["32"]["status"] == "pending"
+    assert report["h2"]["repetition"]["32"]["status"] == "not run"
+    text = (out / "report.md").read_text()
+    assert "T32: not run; R32: not run." in text and "Not run: T32 and R32, by the author's decision" in text
+    assert "| Block-DFM, arm T | AR rollouts | (32, 2) | 16 | not run | not run | not run | -- |" in text
+    assert "| (32, 4) | 8 | not run | not read |" in text and "| (32, 2) | not run | | |" in text
+    assert "- B = 32: not run" in text and "- R32: not run" in text
+    # A run that is merely missing is still pending.
+    assert er.main(["--runs", str(tmp_path / "none"), "--baseline", str(baseline), "--out", str(tmp_path / "r0")]) == 0
+    empty = json.loads((tmp_path / "r0" / "report.json").read_text())
+    assert empty["h1"]["status"] == "pending" and empty["h2"]["status"] == "pending"      # the B = 16 cells are due
+    assert "T16: not found; R16: not found; T32: not run; R32: not run." in (tmp_path / "r0" / "report.md").read_text()
     assert report["section_5_4"]["applies"] is False and report["deviations"] == []
     # All four runs.
     _write_run(runs, "T32", {"rollouts": FALLING, "references": FALLING})

@@ -53,7 +53,11 @@ Three readings that the author confirmed on 24 November 2026, before any result 
 The report also checks every configuration against what Section 5 and C8 fix (problems, samples, split, token
 draw, no early exit, fused commit, no registers, the run's final checkpoint, the pass audit), and that the two arms
 of a block size start from the same held-out losses at step 0, and lists what does not match under "Deviations
-found by the report". Writes ``OUT/report.md`` and ``OUT/report.json``.
+found by the report".
+
+E0 was stopped after R16 (the author's decision of 25 November 2026, docs/e0.md Section 9): T32 and R32 are not
+run. Unless their run directories exist, the report prints them as "not run", leaves their cells empty and says
+that H2 (ii) and (iii), which need all four cells, are not read; that is not a failed H2. Writes ``OUT/report.md`` and ``OUT/report.json``.
 """
 
 from __future__ import annotations
@@ -85,6 +89,9 @@ FLOOR = 0.02               # "near the floor" (Section 5.4, C11)
 RESAMPLES, SEED = 10_000, 0
 EPS = 1e-9                 # Pass@1 moves in steps of 1/450; below this, two values are equal
 STEP0_TOLERANCE = 1e-3     # nats: two arms' untrained held-out losses, equal up to GPU rounding
+# Runs that the author decided not to run (docs/e0.md, Section 9, 25 November 2026); "not run" unless they exist.
+DECIDED_NOT_RUN: tuple[str, ...] = ("T32", "R32")
+NOT_RUN = "not run"
 AR_DOCUMENTED = 0.238      # the released generate on MBPP validation (measured on the predecessor)
 # The readings of the module docstring that the author confirmed (docs/e0.md, Section 9); printed with every report.
 READINGS = ("confirmed by the author on 24 November 2026, before any result (docs/e0.md, Section 9): arm R is \"at "
@@ -186,8 +193,8 @@ def h2_verdict(d: Mapping[tuple[int, int], Interval], growth: Interval | None,
     if out["missing"] or growth is None:
         partial = ", ".join(f"({b}, {k}): {'holds' if e['holds'] else 'does not hold'}"
                             + (" clearly" if e["clear"] else "") for (b, k), e in exceeds.items())
-        out.update(status="pending", grows=None, text="pending: (ii) and (iii) need all four cells"
-                   + (f"; (i) so far: {partial}" if partial else ""))
+        out.update(status="pending", grows=None, partial=partial,
+                   text="pending: (ii) and (iii) need all four cells" + (f"; (i) so far: {partial}" if partial else ""))
         return out
     d8 = (d[(16, 2)][0] + d[(32, 4)][0]) / 2
     grows = d[(16, 4)][0] <= d8 + EPS and d8 <= d[(32, 2)][0] + EPS
@@ -423,6 +430,7 @@ def build(runs_dir: Path, baseline_dir: Path, predecessor_dir: Path | None = Non
         config_json = _json(run_dir / "config.json")
         metrics = _read_rows(run_dir / "metrics.jsonl") if (run_dir / "metrics.jsonl").exists() else []
         info: dict[str, Any] = {"exists": run_dir.is_dir(), "arm": arm, "block": block, "config": config_json,
+                                "not_run": name in DECIDED_NOT_RUN and not run_dir.is_dir(),
                                 "timing": _json(run_dir / "timing.json"), "memory": _json(run_dir / "memory.json"),
                                 "curves": {t: held_out_curve(metrics, t) for t in ("references", "rollouts")},
                                 "last_train": next((r for r in reversed(metrics) if "train/loss" in r), None),
@@ -480,7 +488,8 @@ def build(runs_dir: Path, baseline_dir: Path, predecessor_dir: Path | None = Non
             name = f"{arm_letter}{cell[0]}"
             label = f"Block-DFM, arm {arm_letter}" + (" (H1, H3)" if arm_letter == "T" and cell == H1_CELL else "")
             row = {"model": label, "target": "AR rollouts" if arm_letter == "T" else "human references",
-                   "cell": cell, "g": str(cell[0] // cell[1]), "source": "measured, E0"}
+                   "cell": cell, "g": str(cell[0] // cell[1]), "source": "measured, E0",
+                   "not_run": runs[name]["not_run"]}
             for order in ORDERS:
                 vec = pass_of(name, cell, order)
                 row[order] = boot([vec], lambda a: a) if vec is not None else None
@@ -508,6 +517,12 @@ def build(runs_dir: Path, baseline_dir: Path, predecessor_dir: Path | None = Non
     h2 = h2_verdict(d, growth, arm_r)
     h2["growth"] = growth
     h2["differences"] = d
+    not_run_cells = [cell for cell in CELLS if runs[f"T{cell[0]}"]["not_run"] or runs[f"R{cell[0]}"]["not_run"]]
+    h2["not_run"] = not_run_cells
+    if h2["status"] == "pending" and h2["missing"] and all(cell in not_run_cells for cell in h2["missing"]):
+        h2.update(status="not read", text="(ii) and (iii) are not read: they need all four cells, and the B = 32 runs "
+                  "were not run (docs/e0.md, Section 9); this is not a failed H2"
+                  + (f"; (i) at the cells run: {h2['partial']}" if h2.get("partial") else ""))
     repetition: dict[int, dict[str, Any]] = {}
     for block in (16, 32):
         r_info, t_info = runs[f"R{block}"], runs[f"T{block}"]
@@ -515,6 +530,9 @@ def build(runs_dir: Path, baseline_dir: Path, predecessor_dir: Path | None = Non
                    if r_info["final_step"] else None)
         t_curve = (curve_reading(t_info["curves"]["rollouts"], t_info["final_step"])
                    if t_info["final_step"] else None)
+        if r_info["not_run"] or t_info["not_run"]:
+            repetition[block] = {"status": NOT_RUN, "text": NOT_RUN}
+            continue
         if r_curve is None or t_curve is None:
             repetition[block] = {"status": "pending", "text": f"pending: both B = {block} runs to their last step"}
             continue
@@ -539,6 +557,7 @@ def build(runs_dir: Path, baseline_dir: Path, predecessor_dir: Path | None = Non
             arm_t[cell] = (float(exact.mean()), float(prefix.mean()))
     h3 = h3_verdict(order_d, arm_t)
     h3["differences"] = order_d
+    h3["not_run"] = [cell for cell in CELLS if runs[f"T{cell[0]}"]["not_run"]]
     section_5_4 = failed_h1_reading(h1, arm_r.get(H1_CELL), d.get(H1_CELL))
 
     data_summary = _json(data_dir / "summary.json") if data_dir else None
@@ -557,6 +576,9 @@ def render(report: Mapping[str, Any]) -> str:
     found = []
     for name in RUN_NAMES:
         info = runs[name]
+        if info["not_run"]:
+            found.append(f"{name}: {NOT_RUN}")
+            continue
         if not info["exists"]:
             found.append(f"{name}: not found")
             continue
@@ -568,7 +590,13 @@ def render(report: Mapping[str, Any]) -> str:
              f"{report['tasks']} problems; 95% intervals from a bootstrap over problems, paired between "
              f"configurations, {report['resamples']:,} resamples, seed {report['seed']}. Block rows are *measured* "
              "by E0; the AR and whole-canvas rows are *measured on the predecessor*.", "",
-             "Runs: " + "; ".join(found) + ".", "", "## Deviations found by the report", ""]
+             "Runs: " + "; ".join(found) + "."]
+    skipped = [name for name in RUN_NAMES if runs[name]["not_run"]]
+    if skipped:
+        lines += ["", f"Not run: {' and '.join(skipped)}, by the author's decision of 25 November 2026, taken after "
+                  "T16's evaluation and before R16's (`docs/e0.md`, Section 9); a deviation from C3 and C12. Their "
+                  "cells are empty, and the rules that need them are not read."]
+    lines += ["", "## Deviations found by the report", ""]
     lines += [f"- {d}" for d in report["deviations"]] or ["- none"]
 
     lines += ["", "## The table of Section 6 (Pass@1 in %, 95% interval)", "",
@@ -583,6 +611,8 @@ def render(report: Mapping[str, Any]) -> str:
             if order in row.get("documented", {}):
                 notes.append("documented")
             cells.append(_pct(row[order]) + (f" ({'; '.join(notes)})" if notes else ""))
+        if row.get("not_run"):
+            cells = [NOT_RUN] * len(ORDERS)
         lines.append(f"| {row['model']} | {row['target']} | {_cell(row['cell'])} | {row['g']} | {' | '.join(cells)} | "
                      f"{_ratio_text(row['ratio'])} |")
     lines += ["", "The whole-canvas rows' ratio uses their exact-kernel column, and the left-to-right row its own. "
@@ -605,6 +635,8 @@ def render(report: Mapping[str, Any]) -> str:
             e = h2["exceeds"][cell]
             verdict = ("clearly " if e["clear"] else "") + ("holds" if e["holds"] else "does not hold")
             lines.append(f"| {_cell(cell)} | {cell[0] // cell[1]} | {_points(h2['differences'][cell])} | {verdict} |")
+        elif cell in h2["not_run"]:
+            lines.append(f"| {_cell(cell)} | {cell[0] // cell[1]} | {NOT_RUN} | not read |")
         else:
             lines.append(f"| {_cell(cell)} | {cell[0] // cell[1]} | -- | pending |")
     if h2.get("grows") is not None:
@@ -625,6 +657,8 @@ def render(report: Mapping[str, Any]) -> str:
             c = h3["cells"][cell]
             lines.append(f"| {_cell(cell)} | {_points(h3['differences'][cell])} | "
                          f"{'yes' if c['at_least_as_good'] else 'no'} | {c['reading']} |")
+        elif cell in h3["not_run"]:
+            lines.append(f"| {_cell(cell)} | {NOT_RUN} | | |")
         else:
             lines.append(f"| {_cell(cell)} | -- | pending | |")
 
@@ -681,8 +715,8 @@ def render(report: Mapping[str, Any]) -> str:
     lines += ["", "### Training", ""]
     for name in RUN_NAMES:
         info = runs[name]
-        if not info["exists"]:
-            lines.append(f"- {name}: not found")
+        if info["not_run"] or not info["exists"]:
+            lines.append(f"- {name}: {NOT_RUN if info['not_run'] else 'not found'}")
             continue
         last = info["last_train"] or {}
         timing = info["timing"] or {}

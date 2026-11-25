@@ -9,16 +9,16 @@ before changing any math, and cite the equation in a comment. `docs/preprint-cor
 is known to get wrong (the "two tokens per pass" reading of K = 128, the finished latent oracle, two points of
 Table 5): do not repeat those statements, and do not edit the preprint unasked.
 
-**Status: E0 is being closed at B = 16; its first result is negative.** The code on `main` is text-VPA's verified Stage 0
+**Status: E0 is closed at B = 16 with a negative result; E1 is being prepared (`docs/e1.md`).** The code on `main` is text-VPA's verified Stage 0
 code (`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the
 Block-DFM core, its tests, the rollout generator and the checks for the L4 exist, and the checks have run (the port
 is exact: `docs/e0.md`, Section 2.4). The author has confirmed all of `docs/e0.md` (C1 to C12, 23 November 2026);
 it is frozen, and a later change is a deviation recorded in its Section 9. The rollout writer, the E0 trainer, the
 evaluation script and the report exist and are tested on the CPU with the tiny model. The writer has run on the L4
-and E0's training data is written (`docs/e0.md`, Section 4). T16 is trained and evaluated (H1 clearly fails:
-`runs/e0-report/report.md` on the server); by the author's decision of 25 November 2026 E0 stops after R16 and the
-B = 32 runs are not run (`docs/e0.md`, Section 9). The author is redirecting the project from E1 on (lossless,
-AR-verified drafting on Gemma 4 E2B-it); nothing of that is decided or recorded in `docs/` yet.
+and E0's training data is written (`docs/e0.md`, Section 4). T16 and R16 are trained and evaluated: H1 clearly
+fails (Pass@1 0.4% [0.0, 1.1] at (16, 4), 1.9% of the AR baseline), arm R is at the floor, and by Section 5.4 the
+preprint's student is not trained (`docs/e0.md`, Section 10). By the author's decision of 25 November 2026 the
+B = 32 runs are not run (Section 9).
 
 ## Layout
 
