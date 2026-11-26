@@ -274,7 +274,7 @@ def test_the_gpu_backend_and_a_file_without_thinking(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "litert_lm", fake)
     model = tmp_path / "model.litertlm"
     model.write_bytes(b"x")
-    engines, failed, conversation_args, facts = lt._open_engines(model, ["off", "on"], "gpu", 4, tmp_path)
+    engines, failed, conversation_args, facts = lt.open_engines(model, ["off", "on"], "gpu", 4, tmp_path)
     assert list(engines) == ["off", "on"] and failed == {}
     assert all(entry[2] == fake.Backend.GPU() for entry in log)
     assert "thinking_config" not in conversation_args and facts["thinking_support"] is False

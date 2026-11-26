@@ -14,20 +14,21 @@ R5, 25 November 2026) ran on the server on 26 November 2026 and is read by its r
 Google's drafter pays clearly in PyTorch on the L4 (1.43x at G = 2 in bfloat16, where it is not token-identical;
 1.42x at G = 4 in float32, exact on its sample) and on the CPU (1.57x at G = 2, exact), gains 5% in LiteRT-LM, and
 vLLM's table is not read for R2 (its drift check excluded 1); R4 names A2 as Step 1's first trained arm and R5
-admits B1. Step 1 has a draft registration that awaits the author's confirmation (`docs/e1.md`, Section 11); its arm
-A3 is the author's block-latent drafter (Section 6.1, with the 2026 prior work in 6.2). Nothing of Step 1 is trained
-before he confirms.** E1 leaves the preprint's protocol by the author's decision of 25 November 2026: drafting that
-the frozen `google/gemma-4-E2B-it` verifies exactly, measured against Google's own drafter for it; for E1,
-`docs/e1.md` holds where it and the preprint disagree. The code on `main` is text-VPA's verified Stage 0 code
-(`docs/provenance.md`). The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the Block-DFM
-core, its tests, the rollout generator and the checks for the L4 exist, and the checks have run (the port is exact:
-`docs/e0.md`, Section 2.4). The author has confirmed all of `docs/e0.md` (C1 to C12, 23 November 2026); it is
-frozen, and a later change is a deviation recorded in its Section 9. The rollout writer, the E0 trainer, the
-evaluation script and the report exist and are tested on the CPU with the tiny model. The writer has run on the L4
-and E0's training data is written (`docs/e0.md`, Section 4). T16 and R16 are trained and evaluated: H1 clearly fails
-(Pass@1 0.4% [0.0, 1.1] at (16, 4), 1.9% of the AR baseline), arm R is at the floor, and by Section 5.4 the
-preprint's student is not trained (`docs/e0.md`, Section 10). By the author's decision of 25 November 2026 the
-B = 32 runs are not run (Section 9).
+admits B1. Step 1 is registered and confirmed by the author (27 November 2026; `docs/e1.md`, Section 11): P2 first
+(LiteRT-LM's GPU exactness, `scripts/ncp/e1_p2.sh`), then the timing runs, the rollouts (English first), A2 and A3,
+the author's block-latent drafter (Section 6.1, with the 2026 prior work in 6.2); B1 waits behind his sign-off after
+A2 and A3. Nothing is trained before he confirms the GPU time the timing runs imply.** E1 leaves the preprint's
+protocol by the author's decision of 25 November 2026: drafting that the frozen `google/gemma-4-E2B-it` verifies
+exactly, measured against Google's own drafter for it; for E1, `docs/e1.md` holds where it and the preprint
+disagree. The code on `main` is text-VPA's verified Stage 0 code (`docs/provenance.md`). The first experiment is E0
+(preprint Sec. 6.2), developed on branch `e0`: the Block-DFM core, its tests, the rollout generator and the checks
+for the L4 exist, and the checks have run (the port is exact: `docs/e0.md`, Section 2.4). The author has confirmed
+all of `docs/e0.md` (C1 to C12, 23 November 2026); it is frozen, and a later change is a deviation recorded in its
+Section 9. The rollout writer, the E0 trainer, the evaluation script and the report exist and are tested on the CPU
+with the tiny model. The writer has run on the L4 and E0's training data is written (`docs/e0.md`, Section 4). T16
+and R16 are trained and evaluated: H1 clearly fails (Pass@1 0.4% [0.0, 1.1] at (16, 4), 1.9% of the AR baseline),
+arm R is at the floor, and by Section 5.4 the preprint's student is not trained (`docs/e0.md`, Section 10). By the
+author's decision of 25 November 2026 the B = 32 runs are not run (Section 9).
 
 ## Layout
 
@@ -63,6 +64,7 @@ B = 32 runs are not run (Section 9).
 | `chat_vpa/e1_vllm.py` | | Step 0 in vLLM (its own environment): `run` one arm (`off` or `mtp:G`, Google's drafter through vLLM's Gemma 4 MTP path) per engine and process, `summarize` the arms against `off-1` (with `off-2` as the drift check), `smoke` for the preflight |
 | `chat_vpa/e1_preflight.py`, `e1_report.py` | | the downloaded target and drafter against what Step 0 assumes, with a smoke decode; Step 0's tables as they stand (reads no rule) |
 | `scripts/ncp/e1_setup.sh`, `e1_step0.sh` | | E1's downloads, the three environments and the preflight (`show` prints what the author pastes back); Step 0's five parts in tmux (bridge, ceiling, decode, litert, vllm), each skipped once done (`show`: the tables) |
+| `chat_vpa/e1_p2.py`, `scripts/ncp/e1_p2.sh` | | Step 1's P2 (`docs/e1.md`, Section 11.7): `run`, one LiteRT-LM engine of one mode per process (LiteRT-LM's environment, no torch); `read`, the texts of the runs compared, the first token at which two responses part scored by the target in float32, the registered rule applied; the script runs off-a, on-a, off-b, on-b in tmux (`show`: the reading) |
 | `docs/e1.md` | | the pre-registration of E1 (Step 0 confirmed and frozen, 25 November 2026): the question and the author's decisions, setup and preflight, Step 0's measurements and timing rules, reading rules R1 to R5, choices C1 to C11; Step 1 as a sketch with A3's design (D1 to D8, its oracle and break-even gates) and the prior work on block latents; what could not be tested off the server; Step 0's tables and their readings (Section 10); Step 1's draft registration, S1 to S14 with A3's D1 to D8 (Section 11) |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |

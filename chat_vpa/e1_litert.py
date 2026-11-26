@@ -54,7 +54,7 @@ from typing import Any
 
 from chat_vpa.e1_common import file_sha256, median, read_prompts, write_json
 
-__all__ = ["MODES", "first_text_difference", "message_text", "respond", "run", "summarize"]
+__all__ = ["MODES", "first_text_difference", "message_text", "open_engines", "respond", "run", "summarize"]
 
 MODES = ("off", "on", "adaptive")
 
@@ -189,7 +189,7 @@ def _runtime_version() -> str:
         return "of unknown version"
 
 
-def _open_engines(model: Path, modes: Sequence[str], backend: str, threads: int | None, cache_dir: Path
+def open_engines(model: Path, modes: Sequence[str], backend: str, threads: int | None, cache_dir: Path
                   ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
     """The engines that could be created, the modes that could not (with the runtime's message), the arguments
     of every conversation, and what the model file says about itself."""
@@ -247,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     cache_dir = args.cache_dir or args.model.parent / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    engines, failed, conversation_args, facts = _open_engines(args.model, modes, args.backend, args.threads, cache_dir)
+    engines, failed, conversation_args, facts = open_engines(args.model, modes, args.backend, args.threads, cache_dir)
     for mode, reason in failed.items():
         print(f"mode {mode} could not be started: {reason}", flush=True)
     if "off" not in engines:

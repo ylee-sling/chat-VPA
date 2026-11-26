@@ -54,12 +54,14 @@ The numbers that motivated the design are measurements of the predecessor (text-
 
 ## Next
 
-**E1, Step 1** ([`docs/e1.md`](docs/e1.md), Section 11, a draft for the author to confirm; nothing is trained
-before he does). By Step 0's rules the first trained arm is A2, Google's drafter distilled on the model's own
-greedy rollouts; then A3, a drafter that decides one latent code per block and drafts the block in one call; and
-B1, E0's Block-DFM as a drafter the model verifies, which Step 0's bridge admitted (E0's checkpoints, unchanged,
-yield 2.6 tokens per backbone pass on MBPP code). Before any product claim the LiteRT-LM measurement runs on a
-physical laptop. Step 0 itself (`bash scripts/ncp/e1_setup.sh`, then `bash scripts/ncp/e1_step0.sh`) measured
+**E1, Step 1** ([`docs/e1.md`](docs/e1.md), Section 11, confirmed by the author on 27 November 2026). First a
+check of LiteRT-LM's GPU backend, whose speculative decoding did not keep the model's text in Step 0
+(`bash scripts/ncp/e1_p2.sh`); then timing runs, the model's own greedy rollouts on English prompts, and the
+first trained arm by Step 0's rules, A2: Google's drafter distilled on those rollouts; then A3, a drafter that
+decides one latent code per block and drafts the block in one call. B1, E0's Block-DFM as a drafter the model
+verifies, which Step 0's bridge admitted (E0's checkpoints, unchanged, yield 2.6 tokens per backbone pass on
+MBPP code), waits for the author's sign-off after A2 and A3. Before any product claim the LiteRT-LM measurement
+runs on a physical laptop. Step 0 itself (`bash scripts/ncp/e1_setup.sh`, then `bash scripts/ncp/e1_step0.sh`) measured
 the model alone and with Google's drafter in PyTorch, LiteRT-LM and vLLM, the ceiling that the cost of a pass sets
 for any drafter, and E0's checkpoints as verified block drafters.
 
