@@ -15,9 +15,10 @@ Google's drafter pays clearly in PyTorch on the L4 (1.43x at G = 2 in bfloat16, 
 1.42x at G = 4 in float32, exact on its sample) and on the CPU (1.57x at G = 2, exact), gains 5% in LiteRT-LM, and
 vLLM's table is not read for R2 (its drift check excluded 1); R4 names A2 as Step 1's first trained arm and R5
 admits B1. Step 1 is registered and confirmed by the author (27 November 2026; `docs/e1.md`, Section 11): P2 first
-(LiteRT-LM's GPU exactness, `scripts/ncp/e1_p2.sh`), then the timing runs, the rollouts (English first), A2 and A3,
-the author's block-latent drafter (Section 6.1, with the 2026 prior work in 6.2); B1 waits behind his sign-off after
-A2 and A3. Nothing is trained before he confirms the GPU time the timing runs imply.** E1 leaves the preprint's
+(LiteRT-LM's GPU exactness, `scripts/ncp/e1_p2.sh`), then the timing runs (`scripts/ncp/e1_step1.sh`: the rollout
+writer and A2's and A3-0's trainer are built and tested on the CPU), the rollouts (English first), A2 and A3, the
+author's block-latent drafter (Section 6.1, with the 2026 prior work in 6.2); B1 waits behind his sign-off after A2
+and A3. Nothing is trained before he confirms the GPU time the timing runs imply.** E1 leaves the preprint's
 protocol by the author's decision of 25 November 2026: drafting that the frozen `google/gemma-4-E2B-it` verifies
 exactly, measured against Google's own drafter for it; for E1, `docs/e1.md` holds where it and the preprint
 disagree. The code on `main` is text-VPA's verified Stage 0 code (`docs/provenance.md`). The first experiment is E0
@@ -65,6 +66,9 @@ author's decision of 25 November 2026 the B = 32 runs are not run (Section 9).
 | `chat_vpa/e1_preflight.py`, `e1_report.py` | | the downloaded target and drafter against what Step 0 assumes, with a smoke decode; Step 0's tables as they stand (reads no rule) |
 | `scripts/ncp/e1_setup.sh`, `e1_step0.sh` | | E1's downloads, the three environments and the preflight (`show` prints what the author pastes back); Step 0's five parts in tmux (bridge, ceiling, decode, litert, vllm), each skipped once done (`show`: the tables) |
 | `chat_vpa/e1_p2.py`, `scripts/ncp/e1_p2.sh` | | Step 1's P2 (`docs/e1.md`, Section 11.7): `run`, one LiteRT-LM engine of one mode per process (LiteRT-LM's environment, no torch); `read`, the texts of the runs compared, the first token at which two responses part scored by the target in float32, the registered rule applied; the script runs off-a, on-a, off-b, on-b in tmux (`show`: the reading) |
+| `chat_vpa/e1_rollouts.py` | | Step 1's data (`docs/e1.md`, Section 11.3): the qualifying `train_sft` first turns by number; the target's own greedy rollouts, batched in bfloat16, in resumable chunks (the batch halved on out-of-memory); the training prompts that are development prompts, counted; `summary` with the measured rate |
+| `chat_vpa/e1_train.py` | | Step 1's A2 and A3-0 (Sections 11.4, 11.5): the frozen target's pass without gradients; Google's drafter unrolled over 4 depths on the accepted path (A2) or called once over 8 slots with a learned code (A3-0), with the keys of Transformers' first cycle; token and cluster cross-entropy over the vocabulary in chunks; held-out curves; `RUN/final` as a `Gemma4AssistantForCausalLM` directory; `--stop-at` for the timing |
+| `scripts/ncp/e1_step1.sh` | | Step 1's timing runs (Section 11.8) in tmux: the writer's first chunk, 100 steps each of A2 and A3-0 (`show`: what the author pastes back); `e1_setup.sh train-data` downloads `train_sft` |
 | `docs/e1.md` | | the pre-registration of E1 (Step 0 confirmed and frozen, 25 November 2026): the question and the author's decisions, setup and preflight, Step 0's measurements and timing rules, reading rules R1 to R5, choices C1 to C11; Step 1 as a sketch with A3's design (D1 to D8, its oracle and break-even gates) and the prior work on block latents; what could not be tested off the server; Step 0's tables and their readings (Section 10); Step 1's draft registration, S1 to S14 with A3's D1 to D8 (Section 11) |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
@@ -252,6 +256,11 @@ C9).
   first server preflight; `tests/test_e1.py` runs each E1 command without `--device`.
 - **The IFEval checker is run with `random.seed(0)` and `langdetect.DetectorFactory.seed = 0`**: as shipped, two
   runs on the same responses differ by a prompt or two (`docs/e1.md`, Section 2).
+- **A drafter trains with the keys of Transformers' first cycle after a prefill** (`e1_train.visibility`): a query at
+  q sees the target's keys of every position before q in full attention and of the W + 1 before q in sliding
+  attention; a batched call under it reproduces Transformers' single-query call (tested). Transformers 5.21 hands
+  its drafter rejected drafts' keys after a partly accepted cycle; a strict `xfail` test keeps that in view, and
+  the author decides what the PyTorch tables do about it (`docs/e1.md`, Section 11.9).
 - **In bfloat16 the model's own `generate` and this repository's realizer path can choose different tokens**
   (2 of 48 positions on the tests' tiny model; none in float32): a check of exact equality between two code
   paths is made in float32, or its bfloat16 result is reported as a measurement.

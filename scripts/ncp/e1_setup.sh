@@ -12,6 +12,8 @@
 #   bash scripts/ncp/e1_setup.sh runtimes    vLLM, LiteRT-LM and the IFEval checker, each in its own environment
 #   bash scripts/ncp/e1_setup.sh preflight   the checks (needs the GPU free)
 #   bash scripts/ncp/e1_setup.sh run         the three in the foreground
+#   bash scripts/ncp/e1_setup.sh train-data  Step 1's prompts: UltraChat-200K's train_sft split (docs/e1.md, Section
+#                                            11.3; needs the network; e1_step1.sh runs it when the files are missing)
 #
 # A step that fails does not stop the next one (a runtime that will not install must not hide the preflight of
 # the rest); the preflight says what is missing, and every step can be run again.
@@ -21,6 +23,7 @@
 #   models/gemma-4-E2B-it-assistant    google/gemma-4-E2B-it-assistant, Google's Multi-Token Prediction drafter
 #   litert/gemma-4-E2B-it.litertlm     litert-community/gemma-4-E2B-it-litert-lm (LiteRT-LM's build, drafter inside)
 #   data/ultrachat_200k                HuggingFaceH4/ultrachat_200k, the test_sft split only (the development prompts)
+#   data/ultrachat_200k_train          the same dataset's train_sft split (Step 1's training prompts; train-data)
 #   ifeval/                            google-research's instruction_following_eval: the checker and its 541 prompts
 #   prompts/dev.jsonl                  the development prompts (chat_vpa/e1_prompts.py)
 #   venvs/{vllm,litert,ifeval}         the three environments
@@ -127,6 +130,31 @@ PYEOF
   log "assets under $ASSETS: $(du -sh "$ASSETS" | cut -f1)"
   [[ -z "$failed" ]] || die "incomplete:$failed (the lines above say why; run 'bash scripts/ncp/e1_setup.sh assets' again)"
   log "assets ready"
+}
+
+# train-data: the train_sft split, in a directory of its own (the test_sft download's .complete marker must not
+# make it look done), for Step 1's rollouts (docs/e1.md, Section 11.3, S2).
+train_data() {
+  online
+  check_python_only
+  mkdir -p "$ASSETS/data"
+  "$PY" - "$ASSETS" <<'PYEOF'
+import os, sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+target = Path(sys.argv[1]) / "data" / "ultrachat_200k_train"
+if (target / ".complete").exists():
+    print(f"  {target}: complete, skipping", flush=True)
+    sys.exit(0)
+snapshot_download("HuggingFaceH4/ultrachat_200k", repo_type="dataset", local_dir=target,
+                  token=os.environ.get("HF_TOKEN") or None, allow_patterns=["data/train_sft-*.parquet", "README.md"])
+if not list((target / "data").glob("train_sft-*.parquet")):
+    sys.exit(f"no train_sft parquet file arrived in {target}")
+(target / ".complete").write_text("HuggingFaceH4/ultrachat_200k train_sft\n")
+print(f"  {target}: downloaded", flush=True)
+PYEOF
+  log "train_sft under $ASSETS/data/ultrachat_200k_train: $(du -sh "$ASSETS/data/ultrachat_200k_train" | cut -f1)"
 }
 
 # make_env <name> <packages...>: an environment of its own under runs/assets/venvs.
@@ -308,6 +336,7 @@ case "$ACTION" in
   assets)    assets ;;
   runtimes)  runtimes ;;
   preflight) preflight ;;
+  train-data) train_data ;;
   show)      [[ -f "$LOG" ]] && cat "$LOG" || die "no preflight yet: bash scripts/ncp/e1_setup.sh preflight" ;;
-  *)         die "usage: e1_setup.sh [launch|run|assets|runtimes|preflight|show]" ;;
+  *)         die "usage: e1_setup.sh [launch|run|assets|runtimes|preflight|train-data|show]" ;;
 esac
