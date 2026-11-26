@@ -22,9 +22,13 @@ autoregressive teacher.
 > the protocol's own rule the preprint's student model is not trained. The runs with 32-token blocks were not run
 > (the author's decision of 25 November 2026). One seed, Python only, 450 samples per cell.
 >
-> **From E1 on the project asks another question** ([`docs/e1.md`](docs/e1.md), a draft pre-registration): can a
+> **From E1 on the project asks another question** ([`docs/e1.md`](docs/e1.md), its pre-registration): can a
 > drafter whose tokens the frozen `google/gemma-4-E2B-it` verifies exactly produce the model's own text faster
-> than the model alone and than the drafter Google ships for it? Nothing of E1 has been measured.
+> than the model alone and than the drafter Google ships for it? Step 0, which trains nothing, is measured
+> (26 November 2026; `docs/e1.md`, Section 10). Google's drafter decodes 1.43x faster than the model alone in
+> PyTorch on one NVIDIA L4 in bfloat16, where its output is not token-identical to the model's own, and 1.42x in
+> float32, where it is identical on all 50 prompts; 1.57x on the server's CPU (4 threads, float32, identical); and
+> 1.05x in LiteRT-LM, Google's on-device runtime, on its CPU and GPU backends. Step 1 is a draft registration.
 
 What exists today:
 
@@ -50,13 +54,14 @@ The numbers that motivated the design are measurements of the predecessor (text-
 
 ## Next
 
-**E1, Step 0** trains nothing ([`docs/e1.md`](docs/e1.md), Section 3): the released Gemma 4 E2B-it decoding
-alone, with Google's Multi-Token Prediction drafter and with prompt lookup, in Hugging Face Transformers and in
-LiteRT-LM; the time of one target pass over n positions and the ceiling it sets for any drafter on a device; and
-E0's two checkpoints as block drafters that the frozen backbone verifies. On the server:
-`bash scripts/ncp/e1_setup.sh` (downloads, two further runtimes in environments of their own, a preflight), then
-`bash scripts/ncp/e1_step0.sh`. The open choices and reading rules of `docs/e1.md` are the author's to confirm
-before a number is read.
+**E1, Step 1** ([`docs/e1.md`](docs/e1.md), Section 11, a draft for the author to confirm; nothing is trained
+before he does). By Step 0's rules the first trained arm is A2, Google's drafter distilled on the model's own
+greedy rollouts; then A3, a drafter that decides one latent code per block and drafts the block in one call; and
+B1, E0's Block-DFM as a drafter the model verifies, which Step 0's bridge admitted (E0's checkpoints, unchanged,
+yield 2.6 tokens per backbone pass on MBPP code). Before any product claim the LiteRT-LM measurement runs on a
+physical laptop. Step 0 itself (`bash scripts/ncp/e1_setup.sh`, then `bash scripts/ncp/e1_step0.sh`) measured
+the model alone and with Google's drafter in PyTorch, LiteRT-LM and vLLM, the ceiling that the cost of a pass sets
+for any drafter, and E0's checkpoints as verified block drafters.
 
 E0's record: its pre-registration, the checks before the run, the decisions and the result are in
 [`docs/e0.md`](docs/e0.md). What the preprint draft is known to get wrong is listed in
