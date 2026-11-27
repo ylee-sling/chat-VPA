@@ -6,12 +6,21 @@ decoding the development prompts greedily, alone and with a drafter that it veri
 
     python -m chat_vpa.e1_decode --model MODEL --assistant DRAFTER --prompts ASSETS/prompts/dev.jsonl \\
         --arms ar mtp:2 mtp:4 mtp:6 mtp:8 lookup:10 --out runs/e1-step0/decode/l4-bf16
+    python -m chat_vpa.e1_decode --model MODEL --drafter a1=DRAFTER --drafter a2=runs/e1-step1/a2/final \\
+        --prompts ASSETS/prompts/dev.jsonl --arms ar a1:4 a2:4 a1:4:clean a2:4:clean --out ...
 
 Arms (all through the released model's own ``generate``, batch 1, ``do_sample=False``):
 
     ar          the model alone: one pass per token (the baseline)
-    mtp:G       with Google's Multi-Token Prediction drafter (``assistant_model=``): the drafter proposes G tokens
-                per cycle, the target checks them in one pass and keeps those that equal its own argmax
+    mtp:G       with Google's Multi-Token Prediction drafter (``assistant_model=``, the drafter of ``--assistant``):
+                the drafter proposes G tokens per cycle, the target checks them in one pass and keeps those that
+                equal its own argmax
+    D:G         the same with the drafter labelled D by ``--drafter D=PATH`` (Step 1: A1 and A2 in one run, S9)
+    D:G:clean   the same drafter through Transformers' own candidate generator, except that the target's keys it
+                hands the drafter are cut to the accepted prefix (``AcceptedPrefixKeys``; docs/e1.md, Section
+                11.9, flag 1: after a partly accepted cycle Transformers 5.21 also hands it rejected drafts' keys).
+                After a cycle that accepted no draft the target's sliding cache no longer holds the oldest of the
+                W + 1 keys that a clean cycle shows the drafter's sliding layers, so those see W of them
     lookup:G    prompt-lookup decoding (``prompt_lookup_num_tokens=G``): drafts copied from the context, no
                 drafter model; what repetition alone is worth
 
@@ -43,9 +52,12 @@ import json
 import re
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -65,26 +77,86 @@ from chat_vpa.e1_common import (
     write_json,
 )
 
-__all__ = ["Arm", "PassCounter", "decode_once", "first_difference", "parse_arm", "summarize"]
+__all__ = ["Arm", "PassCounter", "accepted_prefix", "accepted_prefix_keys", "decode_once", "first_difference",
+           "parse_arm", "summarize"]
 
-_ARM = re.compile(r"^(ar)$|^(mtp|lookup):([1-9]\d*)$")
+_ARM = re.compile(r"^(ar)$|^(lookup):([1-9]\d*)$|^([a-z][a-z0-9]*):([1-9]\d*)(:clean)?$")
 
 
 @dataclass(frozen=True)
 class Arm:
-    kind: str            # "ar" | "mtp" | "lookup"
+    kind: str            # "ar" | "mtp" (a drafter) | "lookup"
     length: int = 0      # draft tokens per cycle
+    label: str = "mtp"   # which drafter: "mtp" is --assistant's, any other label one of --drafter's
+    clean: bool = False  # the target's keys cut to the accepted prefix (AcceptedPrefixKeys)
 
     @property
     def name(self) -> str:
-        return self.kind if self.kind == "ar" else f"{self.kind}-{self.length}"
+        if self.kind == "ar":
+            return "ar"
+        if self.kind == "lookup":
+            return f"lookup-{self.length}"
+        return f"{self.label}-{self.length}" + ("-clean" if self.clean else "")
 
 
-def parse_arm(text: str) -> Arm:
+def parse_arm(text: str, labels: Sequence[str] = ("mtp",)) -> Arm:
+    """An arm from its command-line form; ``labels`` are the drafters that exist (``mtp`` and ``--drafter``'s)."""
     match = _ARM.match(text)
-    if not match:
-        raise ValueError(f"an arm is 'ar', 'mtp:G' or 'lookup:G' with G >= 1, not {text!r}")
-    return Arm("ar") if match.group(1) else Arm(match.group(2), int(match.group(3)))
+    if match and match.group(1):
+        return Arm("ar")
+    if match and match.group(2):
+        return Arm("lookup", int(match.group(3)))
+    if match and match.group(4) in labels and match.group(4) not in ("ar", "lookup"):
+        return Arm("mtp", int(match.group(5)), match.group(4), bool(match.group(6)))
+    raise ValueError(f"an arm is 'ar', 'lookup:G', or 'D:G' or 'D:G:clean' for a drafter D among {sorted(labels)} "
+                     f"('mtp' is --assistant's; the others come from --drafter D=PATH), with G >= 1; not {text!r}")
+
+
+def accepted_prefix(states: dict[str, tuple[Tensor, Tensor]], position: int) -> dict[str, tuple[Tensor, Tensor]]:
+    """The target's shared keys and values without the entries at ``position`` and after: those of drafts the
+    verifying pass saw and the target rejected. Every tensor ends at the verifying pass's last position, and the
+    full-attention one starts at position 0, so its length less ``position`` is the number of such entries."""
+    full = states.get("full_attention")
+    if full is None:
+        raise ValueError("the accepted prefix is located through the full-attention keys, which are missing")
+    stale = full[0].shape[2] - position
+    if stale <= 0:
+        return states
+    return {name: (k[:, :, : k.shape[2] - stale], v[:, :, : v.shape[2] - stale]) for name, (k, v) in states.items()}
+
+
+@lru_cache(maxsize=1)
+def _accepted_prefix_class() -> Any:
+    """``SinglePositionMultiTokenCandidateGenerator`` with the target's keys cut to the accepted prefix before it
+    uses them; everything else is Transformers' own."""
+    from transformers.generation.candidate_generator import SinglePositionMultiTokenCandidateGenerator
+
+    class AcceptedPrefixKeys(SinglePositionMultiTokenCandidateGenerator):
+        def get_candidates(self, input_ids: Tensor, model_kwargs: dict[str, Any], model_outputs: Any,
+                           is_first_iteration: bool, n_last_matches: int, **kwargs: Any) -> Any:
+            states = getattr(model_outputs, "shared_kv_states", None) if model_outputs is not None else None
+            if not is_first_iteration and states:
+                # The drafted queries sit at the last token's position (Transformers' own rule).
+                model_outputs = SimpleNamespace(hidden_states=model_outputs.hidden_states,
+                                                shared_kv_states=accepted_prefix(states, input_ids.shape[1] - 1))
+            return super().get_candidates(input_ids, model_kwargs, model_outputs, is_first_iteration,
+                                          n_last_matches, **kwargs)
+
+    return AcceptedPrefixKeys
+
+
+@contextmanager
+def accepted_prefix_keys() -> Iterator[None]:
+    """Within the block, ``generate`` builds ``AcceptedPrefixKeys`` where it would build Transformers' MTP
+    candidate generator (it looks the class up by name in ``transformers.generation.utils`` at each call)."""
+    import transformers.generation.utils as generation
+
+    original = generation.SinglePositionMultiTokenCandidateGenerator
+    generation.SinglePositionMultiTokenCandidateGenerator = _accepted_prefix_class()
+    try:
+        yield
+    finally:
+        generation.SinglePositionMultiTokenCandidateGenerator = original
 
 
 class PassCounter:
@@ -136,28 +208,33 @@ class _Arrival:
 @torch.no_grad()
 def decode_once(model: Any, assistant: Any, ids: Tensor, arm: Arm, max_new_tokens: int, profile: bool = False
                 ) -> dict[str, Any]:
-    """One greedy response of one arm. ``ids`` is ``[1, P]`` on the model's device."""
+    """One greedy response of one arm. ``ids`` is ``[1, P]`` on the model's device. ``assistant`` is the drafter
+    of every drafter arm, or a mapping from the arms' labels to drafters."""
     device = ids.device
     sync = synchronizer(device)
     kwargs: dict[str, Any] = {"max_new_tokens": max_new_tokens, "do_sample": False, "temperature": None,
                               "top_p": None, "top_k": None}
+    drafter_model = None
     if arm.kind == "mtp":
-        if assistant is None:
-            raise ValueError("an mtp arm needs the drafter (--assistant)")
-        assistant.generation_config.num_assistant_tokens = arm.length
-        assistant.generation_config.num_assistant_tokens_schedule = "constant"
-        kwargs["assistant_model"] = assistant
+        drafter_model = assistant.get(arm.label) if isinstance(assistant, dict) else assistant
+        if drafter_model is None:
+            raise ValueError(f"the arm {arm.name} needs its drafter ({arm.label}: --assistant or --drafter)")
+        drafter_model.generation_config.num_assistant_tokens = arm.length
+        drafter_model.generation_config.num_assistant_tokens_schedule = "constant"
+        kwargs["assistant_model"] = drafter_model
     elif arm.kind == "lookup":
         kwargs["prompt_lookup_num_tokens"] = arm.length
     arrival = _Arrival(sync)
     target = PassCounter(model, sync if profile else None)
-    drafter = PassCounter(assistant if arm.kind == "mtp" else None, sync if profile else None)
+    drafter = PassCounter(drafter_model, sync if profile else None)
+    keys = accepted_prefix_keys() if arm.clean else _nothing()
     try:
-        sync()
-        start = time.perf_counter()
-        output = model.generate(ids, attention_mask=torch.ones_like(ids), streamer=arrival, **kwargs)
-        sync()
-        end = time.perf_counter()
+        with keys:
+            sync()
+            start = time.perf_counter()
+            output = model.generate(ids, attention_mask=torch.ones_like(ids), streamer=arrival, **kwargs)
+            sync()
+            end = time.perf_counter()
     finally:
         target.close()
         drafter.close()
@@ -169,6 +246,11 @@ def decode_once(model: Any, assistant: Any, ids: Tensor, arm: Arm, max_new_token
     if profile:
         record.update(target_seconds=target.seconds, drafter_seconds=drafter.seconds)
     return record
+
+
+@contextmanager
+def _nothing() -> Iterator[None]:
+    yield
 
 
 def first_difference(a: Sequence[int], b: Sequence[int]) -> int | None:
@@ -269,6 +351,8 @@ def main(argv: list[str] | None = None) -> int:
                                 epilog=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="the released instruction-tuned checkpoint (a directory)")
     p.add_argument("--assistant", default=None, help="Google's drafter for it (needed by mtp arms)")
+    p.add_argument("--drafter", action="append", default=[], metavar="LABEL=PATH",
+                   help="a drafter for the arms LABEL:G and LABEL:G:clean (repeatable; Step 1: a1=, a2=)")
     p.add_argument("--prompts", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--arms", nargs="+", default=["ar", "mtp:4"])
@@ -280,19 +364,31 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--profile", action="store_true", help="time every pass (never used for a speed-up)")
     p.add_argument("--device", default="auto", help="auto: cuda, then mps, then cpu (chat_vpa.device)")
     args = p.parse_args(argv)
-    arms = [parse_arm(a) for a in args.arms]
+    paths: dict[str, str] = {}
+    for item in args.drafter:
+        label, _, path = item.partition("=")
+        if not path or not re.fullmatch(r"[a-z][a-z0-9]*", label) or label in ("ar", "lookup", "mtp") \
+                or label in paths:
+            raise SystemExit(f"--drafter takes LABEL=PATH with a new lower-case label other than ar, lookup and mtp, "
+                             f"not {item!r}")
+        paths[label] = path
+    if args.assistant:
+        paths["mtp"] = args.assistant
+    try:
+        arms = [parse_arm(a, ("mtp", *paths)) for a in args.arms]
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
     if arms[0].kind != "ar" or len({a.name for a in arms}) != len(arms):
         raise SystemExit("--arms must start with 'ar' and name each arm once")
 
     from chat_vpa.device import resolve_device
 
     device = resolve_device(args.device)
+    if any(a.kind == "mtp" and a.label not in paths for a in arms):
+        raise SystemExit("mtp arms need --assistant")
     model, tokenizer = load_target(args.model, args.dtype, device, args.threads)
-    assistant = None
-    if any(a.kind == "mtp" for a in arms):
-        if not args.assistant:
-            raise SystemExit("mtp arms need --assistant")
-        assistant = load_assistant(args.assistant, args.dtype, device)
+    used = sorted({a.label for a in arms if a.kind == "mtp"})
+    assistant: Any = {label: load_assistant(paths[label], args.dtype, device) for label in used}
     prompts = read_prompts(args.prompts, args.limit)
     encoded = [torch.tensor([chat_ids(tokenizer, row["prompt"])], dtype=torch.long, device=device) for row in prompts]
     for ids in encoded[: args.warmup]:
@@ -320,7 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         "what": "greedy decoding of the development prompts, measured (docs/e1.md, Section 3.1)"
                 + ("; profiled: not for speed-ups" if args.profile else ""),
         "environment": environment(device, args.dtype, args.threads), "model": args.model,
-        "assistant": args.assistant, "prompts": str(args.prompts), "prompts_sha256": file_sha256(args.prompts),
+        "assistant": args.assistant, "drafters": {label: paths[label] for label in used},
+        "prompts": str(args.prompts), "prompts_sha256": file_sha256(args.prompts),
         "max_new_tokens": args.max_new_tokens, "warmup": args.warmup, "profiled": args.profile,
         "chat_template_of_the_first_prompt": template, "arms": summary})
     print(_markdown(summary))

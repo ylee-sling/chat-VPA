@@ -2,12 +2,28 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 SLING AI Inc.
 #
-# e1_step1.sh -- the timing runs of E1's Step 1 (docs/e1.md, Section 11.8; approved 27 November 2026): what the full
-# runs cost on the L4, measured before any of them starts. About half an hour to an hour of the GPU.
+# e1_step1.sh -- E1's Step 1 on the L4 (docs/e1.md, Section 11).
 #
-#   bash scripts/ncp/e1_step1.sh          in tmux (session e1-timing): the three timing runs, then the summary
+#   bash scripts/ncp/e1_step1.sh          the timing runs of Section 11.8 in tmux (session e1-timing); done
 #   bash scripts/ncp/e1_step1.sh run      the same in the foreground
-#   bash scripts/ncp/e1_step1.sh show     the summary the author pastes back; no GPU
+#   bash scripts/ncp/e1_step1.sh show     their summary; no GPU
+#   bash scripts/ncp/e1_step1.sh a2       A2 (approved 27 November 2026), in tmux (session e1-a2): the rest of the
+#                                         rollouts and the held-out set, A2's training, its measurement (S9 with the
+#                                         accepted-prefix arms) and the readings; about 26 hours (predicted)
+#   bash scripts/ncp/e1_step1.sh run-a2   the same in the foreground
+#   bash scripts/ncp/e1_step1.sh show-a2  where it stands, and the readings once they exist; no GPU
+#
+# A2's parts, each skipped once done, so the command can be given again after a failure:
+#   rollouts  chat_vpa/e1_rollouts.py: the training prompts 0 to 99,999 (resuming after the timing run's first
+#             chunk), then the held-out prompts 100,000 to 101,999 (S2 to S5)
+#   train     chat_vpa/e1_train.py --arm a2 (S6 to S8): 12,500 steps of 16 rollouts, held-out curves every 2,500
+#             steps; a stopped run resumes from runs/e1-step1/a2/last.pt
+#   measure   S9: chat_vpa/e1_decode.py with A1 (a1) and A2 (a2) on the development prompts: the L4 in float32,
+#             100 x 256 (ar, both drafters at G = 2, 4, 6, 8, both at G = 4 with the accepted prefix's keys); the
+#             L4 in bfloat16 (ar, each drafter at its best G of the float32 table); the CPU in float32 with
+#             THREADS threads, 20 x 128 (ar, both at G = 2, 4), if CPU_FP32_GIB GiB are free; vLLM (a smoke
+#             decode of A2, then off-1, both at G = 2, 4, 6, 8, off-2)
+#   read      chat_vpa/e1_readings.py: R1, R2, R6, R7, R9 and S11 on those tables (runs/e1-step1/measure/readings.md)
 #
 # 1. the rollout writer (chat_vpa/e1_rollouts.py) on the first chunk of 2,048 of the 100,000 training prompts:
 #    the first chunk of the full run, which resumes after it; it also counts the training prompts that are the
@@ -23,11 +39,15 @@
 # behind B1's gate (docs/e1.md, Section 11.6).
 #
 # Variables (defaults in brackets):
-#   OUT [runs/e1-step1]   ASSETS [runs/assets]   TRAIN_PROMPTS [100000]   BATCH_SIZE [128] (the writer's; halved
-#   on out-of-memory)   STOP_AT [100]   TIMING_EVAL [256]   EXTRA_TRAIN [] (more --set KEY=VALUE for both trainers)
+#   OUT [runs/e1-step1]   ASSETS [runs/assets]   TRAIN_PROMPTS [100000]   HELD_OUT [2000]   BATCH_SIZE [128] (the
+#   writer's; halved on out-of-memory)   STOP_AT [100]   TIMING_EVAL [256]   EXTRA_TRAIN [] (more --set KEY=VALUE)
+#   PARTS ["rollouts train measure read"]   THREADS [4]   CPU_FP32_GIB [24]   MEASURE_PROMPTS [100]   MAX_NEW [256]
+#   MAIN_ARMS ["ar a1:2 a2:2 a1:4 a2:4 a1:4:clean a2:4:clean a1:6 a2:6 a1:8 a2:8"]   CPU_PROMPTS [20]
+#   CPU_MAX_NEW [128]   CPU_ARMS ["ar a1:2 a2:2 a1:4 a2:4"]   VLLM_LENGTHS ["2 4 6 8"]   VLLM_TIMEOUT [7200]
+#   EXTRA_DECODE [], EXTRA_VLLM [] (dry runs)
 # A part that has finished is skipped. Never shuts the server down. Do not git pull while it runs.
 set -euo pipefail
-PASS_VARS="OUT ASSETS TRAIN_PROMPTS BATCH_SIZE STOP_AT TIMING_EVAL EXTRA_TRAIN SESSION"
+PASS_VARS="OUT ASSETS TRAIN_PROMPTS HELD_OUT BATCH_SIZE STOP_AT TIMING_EVAL EXTRA_TRAIN PARTS THREADS CPU_FP32_GIB MEASURE_PROMPTS MAX_NEW MAIN_ARMS CPU_PROMPTS CPU_MAX_NEW CPU_ARMS VLLM_LENGTHS VLLM_TIMEOUT EXTRA_DECODE EXTRA_VLLM SESSION"
 # shellcheck source=scripts/ncp/env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
@@ -39,12 +59,33 @@ BATCH_SIZE="${BATCH_SIZE:-128}"
 STOP_AT="${STOP_AT:-100}"
 TIMING_EVAL="${TIMING_EVAL:-256}"
 EXTRA_TRAIN="${EXTRA_TRAIN:-}"
-SESSION="${SESSION:-e1-timing}"
+HELD_OUT="${HELD_OUT:-2000}"
+PARTS="${PARTS:-rollouts train measure read}"
+THREADS="${THREADS:-4}"
+CPU_FP32_GIB="${CPU_FP32_GIB:-24}"
+MEASURE_PROMPTS="${MEASURE_PROMPTS:-100}"
+MAX_NEW="${MAX_NEW:-256}"
+MAIN_ARMS="${MAIN_ARMS:-ar a1:2 a2:2 a1:4 a2:4 a1:4:clean a2:4:clean a1:6 a2:6 a1:8 a2:8}"
+CPU_PROMPTS="${CPU_PROMPTS:-20}"
+CPU_MAX_NEW="${CPU_MAX_NEW:-128}"
+CPU_ARMS="${CPU_ARMS:-ar a1:2 a2:2 a1:4 a2:4}"
+VLLM_LENGTHS="${VLLM_LENGTHS:-2 4 6 8}"
+VLLM_TIMEOUT="${VLLM_TIMEOUT:-7200}"
+EXTRA_DECODE="${EXTRA_DECODE:-}"
+EXTRA_VLLM="${EXTRA_VLLM:-}"
+case "$ACTION" in
+  a2|run-a2|show-a2) SESSION="${SESSION:-e1-a2}" ;;
+  *)                 SESSION="${SESSION:-e1-timing}" ;;
+esac
 IT_MODEL="$ASSETS/models/gemma-4-E2B-it"
 DRAFTER="$ASSETS/models/gemma-4-E2B-it-assistant"
 PROMPTS="$ASSETS/prompts/dev.jsonl"
 TRAIN_DATA="$ASSETS/data/ultrachat_200k_train"
 ROLLOUTS="$OUT/rollouts/train"
+HELD="$OUT/rollouts/held-out"
+A2="$OUT/a2"
+MEASURE="$OUT/measure"
+VLLM_PY="$ASSETS/venvs/vllm/bin/python"
 
 timing_runs() {
   check_python
@@ -137,9 +178,210 @@ print("B1: not timed (behind B1's gate, Section 11.6)")
 PYEOF
 }
 
+# ---------------------------------------------------------------------------------------------
+# A2: the rollouts, the training, the measurement and the readings
+# ---------------------------------------------------------------------------------------------
+
+# step <directory> <soft|hard> <command...>: run once; a "soft" failure is logged and the script goes on.
+step() {
+  local dir="$1" mode="$2"; shift 2
+  if [[ -f "$dir/.done" ]]; then log "done already: ${dir#"$ROOT"/}"; return 0; fi
+  mkdir -p "$dir"
+  log "start: ${dir#"$ROOT"/}"
+  if "$@"; then
+    touch "$dir/.done"
+    log "finished: ${dir#"$ROOT"/}"
+  elif [[ "$mode" == soft ]]; then
+    log "FAILED, going on: ${dir#"$ROOT"/}"
+  else
+    die "failed: ${dir#"$ROOT"/}"
+  fi
+}
+
+# memory_for_cpu_fp32: CPU_FP32_GIB GiB are available now (the model in float32 is about 19 GiB; a run that does not
+# fit would be killed by the kernel, which may pick another process).
+memory_for_cpu_fp32() {
+  local have
+  have="$(awk '/^MemAvailable:/ {printf "%d", $2 / 1048576}' /proc/meminfo)"
+  if (( have >= CPU_FP32_GIB )); then return 0; fi
+  log "skipped, not run: float32 on the CPU needs about $CPU_FP32_GIB GiB of free memory, $have GiB are available"
+  return 1
+}
+
+# foreign <command...>: vLLM, with a home of its own under runs/assets and its own CUDA allocator settings.
+foreign() {
+  mkdir -p "$ASSETS/home"
+  env -u PYTORCH_CUDA_ALLOC_CONF HOME="$ASSETS/home" XDG_CACHE_HOME="$ASSETS/home/.cache" \
+    XDG_CONFIG_HOME="$ASSETS/home/.config" VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 "$@"
+}
+
+rollouts() {
+  if ! compgen -G "$TRAIN_DATA/data/train_sft-*.parquet" > /dev/null; then
+    ASSETS="$ASSETS" bash "$ROOT/scripts/ncp/e1_setup.sh" train-data || die "the download of train_sft failed"
+  fi
+  step "$ROLLOUTS" hard "$PY" -m chat_vpa.e1_rollouts write --model "$IT_MODEL" \
+    --parquet "$TRAIN_DATA"/data/train_sft-*.parquet --start 0 --count "$TRAIN_PROMPTS" --dev-prompts "$PROMPTS" \
+    --batch-size "$BATCH_SIZE" --out "$ROLLOUTS"
+  step "$HELD" hard "$PY" -m chat_vpa.e1_rollouts write --model "$IT_MODEL" \
+    --parquet "$TRAIN_DATA"/data/train_sft-*.parquet --start "$TRAIN_PROMPTS" --count "$HELD_OUT" \
+    --dev-prompts "$PROMPTS" --batch-size "$BATCH_SIZE" --out "$HELD"
+  "$PY" -m chat_vpa.e1_rollouts summary --out "$ROLLOUTS"
+  "$PY" -m chat_vpa.e1_rollouts summary --out "$HELD"
+}
+
+train() {
+  [[ -f "$ROLLOUTS/.done" && -f "$HELD/.done" ]] || die "the rollouts are not written: PARTS=rollouts first"
+  local extra=()
+  if [[ -n "$EXTRA_TRAIN" ]]; then read -r -a extra <<< "$EXTRA_TRAIN"; extra=(--set "${extra[@]}"); fi
+  step "$A2" hard "$PY" -m chat_vpa.e1_train --arm a2 --model "$IT_MODEL" --assistant "$DRAFTER" \
+    --rollouts "$ROLLOUTS" --held-out "$HELD" --run "$A2" "${extra[@]}"
+  [[ -f "$A2/final/config.json" ]] || die "A2's training ended without its final checkpoint"
+}
+
+measure() {
+  [[ -f "$A2/final/config.json" ]] || die "A2 is not trained: PARTS=train first"
+  local drafters=(--drafter "a1=$DRAFTER" --drafter "a2=$A2/final") device=() cpu=()
+  if [[ "$REQUIRE_GPU" != 1 ]]; then device=(--device cpu); fi
+  # shellcheck disable=SC2086
+  step "$MEASURE/l4-fp32" hard "$PY" -m chat_vpa.e1_decode --model "$IT_MODEL" "${drafters[@]}" \
+    --prompts "$PROMPTS" --limit "$MEASURE_PROMPTS" --max-new-tokens "$MAX_NEW" --dtype fp32 --arms $MAIN_ARMS \
+    --out "$MEASURE/l4-fp32" "${device[@]}" $EXTRA_DECODE
+  local g1 g2
+  g1="$("$PY" -m chat_vpa.e1_readings best --table "$MEASURE/l4-fp32" --drafter a1)"
+  g2="$("$PY" -m chat_vpa.e1_readings best --table "$MEASURE/l4-fp32" --drafter a2)"
+  log "best G in float32: A1 $g1, A2 $g2"
+  local bf16=(--dtype bf16)
+  if [[ "$REQUIRE_GPU" != 1 ]]; then bf16=(--dtype fp32); fi
+  # shellcheck disable=SC2086
+  step "$MEASURE/l4-bf16" hard "$PY" -m chat_vpa.e1_decode --model "$IT_MODEL" "${drafters[@]}" \
+    --prompts "$PROMPTS" --limit "$MEASURE_PROMPTS" --max-new-tokens "$MAX_NEW" "${bf16[@]}" \
+    --arms ar "a1:$g1" "a2:$g2" --out "$MEASURE/l4-bf16" "${device[@]}" $EXTRA_DECODE
+  if memory_for_cpu_fp32; then
+    cpu=(--device cpu --dtype fp32 --threads "$THREADS")
+    # shellcheck disable=SC2086
+    step "$MEASURE/cpu-fp32" soft "$PY" -m chat_vpa.e1_decode --model "$IT_MODEL" "${drafters[@]}" \
+      --prompts "$PROMPTS" --limit "$CPU_PROMPTS" --max-new-tokens "$CPU_MAX_NEW" --warmup 1 --arms $CPU_ARMS \
+      --out "$MEASURE/cpu-fp32" "${cpu[@]}" $EXTRA_DECODE
+  fi
+  measure_vllm
+}
+
+measure_vllm() {
+  if [[ "$REQUIRE_GPU" != 1 ]]; then log "vLLM needs the GPU: skipped in a dry run"; return 0; fi
+  if [[ ! -x "$VLLM_PY" ]]; then log "vLLM is not set up ($VLLM_PY): skipping its table"; return 0; fi
+  local dir="$MEASURE/vllm" g
+  # S9: A2 enters vLLM's table after a smoke decode through vLLM's MTP path, as A1 did in the preflight.
+  # shellcheck disable=SC2086
+  step "$dir/smoke-a2" soft foreign timeout --kill-after=60 "$VLLM_TIMEOUT" "$VLLM_PY" -m chat_vpa.e1_vllm smoke \
+    --model "$IT_MODEL" --assistant "$A2/final" --prompts "$PROMPTS" --arm mtp:4 $EXTRA_VLLM
+  local labels=(a1) a2_ok=0
+  if [[ -f "$dir/smoke-a2/.done" ]]; then labels=(a1 a2); a2_ok=1; else log "A2 did not decode in vLLM: A1 only"; fi
+  vllm_arm off off-1 ""
+  for g in $VLLM_LENGTHS; do
+    vllm_arm "mtp:$g" "a1-$g" "$DRAFTER"
+    if [[ "$a2_ok" == 1 ]]; then vllm_arm "mtp:$g" "a2-$g" "$A2/final"; fi
+  done
+  vllm_arm off off-2 ""
+  if [[ -f "$dir/arms/off-1/.done" ]]; then
+    "$PY" -m chat_vpa.e1_vllm summarize --out "$dir" || log "FAILED, going on: the summary of the vLLM arms"
+  fi
+  log "vLLM: ${labels[*]}"
+}
+
+# vllm_arm <arm> <tag> <drafter or "">: one engine, one process; an arm takes minutes, the timeout only keeps a hung
+# engine from holding the GPU unattended.
+vllm_arm() {
+  local arm="$1" tag="$2" drafter="$3" assistant=()
+  if [[ -n "$drafter" ]]; then assistant=(--assistant "$drafter"); fi
+  # shellcheck disable=SC2086
+  step "$MEASURE/vllm/arms/$tag" soft foreign timeout --kill-after=60 "$VLLM_TIMEOUT" "$VLLM_PY" -m chat_vpa.e1_vllm \
+    run --arm "$arm" --tag "$tag" --model "$IT_MODEL" "${assistant[@]}" --prompts "$PROMPTS" \
+    --limit "$MEASURE_PROMPTS" --max-new-tokens "$MAX_NEW" --out "$MEASURE/vllm" $EXTRA_VLLM
+}
+
+read_a2() {
+  local tables=() t
+  for t in l4-fp32 l4-bf16 cpu-fp32; do
+    if [[ -f "$MEASURE/$t/summary.json" ]]; then tables+=("$MEASURE/$t"); fi
+  done
+  "$PY" -m chat_vpa.e1_readings read --tables "${tables[@]}" --vllm "$MEASURE/vllm" --out "$MEASURE" > /dev/null \
+    || die "the readings failed"
+  log "readings: ${MEASURE#"$ROOT"/}/readings.md"
+}
+
+a2_runs() {
+  check_python
+  check_gpu_free
+  [[ -f "$IT_MODEL/config.json" && -f "$DRAFTER/config.json" && -f "$PROMPTS" ]] \
+    || die "the assets are missing under $ASSETS: bash scripts/ncp/e1_setup.sh"
+  [[ -f "$ROLLOUTS/chunk-00000.json" ]] || log "no timing run before this one: the writer starts at chunk 0"
+  mkdir -p "$OUT"
+  local part
+  for part in $PARTS; do
+    case "$part" in
+      rollouts) rollouts ;;
+      train)    train ;;
+      measure)  measure ;;
+      read)     read_a2 ;;
+      *)        die "unknown part: $part (rollouts, train, measure, read)" ;;
+    esac
+  done
+  log "A2 finished: bash scripts/ncp/e1_step1.sh show-a2"
+}
+
+show_a2() {
+  "$PY" - "$OUT" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+print("== E1 Step 1, A2 (docs/e1.md, Sections 11.3, 11.4)")
+for name in ("train", "held-out"):
+    d = out / "rollouts" / name
+    if (d / "summary.json").exists():
+        s = json.loads((d / "summary.json").read_text())
+        print(f"rollouts/{name}: {s['rollouts']} of {s['of']} ({s['chunks_written']} of {s['chunks']} chunks), "
+              f"{s['budget_stops']} at the budget, {s['rollouts_per_second']:.2f} rollouts/s (measured)"
+              + (", done" if (d / ".done").exists() else ""))
+    else:
+        print(f"rollouts/{name}: not started")
+run = out / "a2"
+if (run / "metrics.jsonl").exists():
+    rows = [json.loads(line) for line in open(run / "metrics.jsonl", encoding="utf-8")]
+    train = [r for r in rows if "train/loss" in r]
+    evals = [r for r in rows if "eval/seconds" in r]
+    config = json.loads((run / "config.json").read_text())["config"]
+    if train:
+        t = train[-1]
+        print(f"a2: step {t['step']} of {config['steps']}, loss {t['train/loss']:.3f}, {t['train/steps_per_s']:.3f} "
+              f"steps/s, {t.get('train/eta_h', 0):.1f} h left (predicted), peak {t.get('train/peak_memory_gib', 0):.1f} "
+              f"GiB, micro-batch {t.get('train/micro_batch', config['batch']):.0f}"
+              + (", done" if (run / "final" / "config.json").exists() else ""))
+    for e in evals:
+        cycles = "  ".join(f"G={k.rsplit('_', 1)[1]}: {v:.2f}" for k, v in e.items()
+                           if k.startswith("eval/tokens_per_cycle_"))
+        print(f"  held-out at step {e['step']}: tokens per cycle along the continuations {cycles}; hit at depth 1 "
+              f"{e.get('eval/hit_1', float('nan')):.3f}")
+else:
+    print("a2: not started")
+measure = out / "measure"
+for table in ("l4-fp32", "l4-bf16", "cpu-fp32", "vllm"):
+    d = measure / table
+    state = "done" if (d / ".done").exists() or (d / "summary.json").exists() else (
+        "running or stopped" if d.exists() else "not started")
+    print(f"measure/{table}: {state}")
+if (measure / "readings.md").exists():
+    print()
+    print((measure / "readings.md").read_text())
+PYEOF
+}
+
 case "$ACTION" in
-  launch) start_tmux "$SESSION" "$OUT/timing.log" "bash scripts/ncp/e1_step1.sh run" ;;
-  run)    timing_runs; show ;;
-  show)   show ;;
-  *)      die "usage: e1_step1.sh [launch|run|show]" ;;
+  launch)  start_tmux "$SESSION" "$OUT/timing.log" "bash scripts/ncp/e1_step1.sh run" ;;
+  run)     timing_runs; show ;;
+  show)    show ;;
+  a2)      start_tmux "$SESSION" "$OUT/a2.log" "bash scripts/ncp/e1_step1.sh run-a2" ;;
+  run-a2)  a2_runs; show_a2 ;;
+  show-a2) show_a2 ;;
+  *)       die "usage: e1_step1.sh [launch|run|show|a2|run-a2|show-a2]" ;;
 esac

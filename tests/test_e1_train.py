@@ -218,6 +218,84 @@ def test_the_loss_is_the_mean_over_depths_of_each_depths_mean(tiny):
     drafter.masked_embedding.token_ordering.copy_(bad)
 
 
+def _three_sequences():
+    generator = torch.Generator().manual_seed(11)
+    return [*_sequences(), {"id": "c", "ids": [2] + torch.randint(6, VOCAB, (9,), generator=generator).tolist() + [1],
+                            "start": 4}]
+
+
+def test_micro_batches_add_up_to_the_batchs_loss_and_gradient(tiny):
+    target, drafter = _models(tiny, torch.float64)
+    clusters = tr.cluster_map(drafter)
+    examples = _three_sequences()
+    params = [p for p in drafter.parameters() if p.requires_grad]
+
+    def run(groups, counts):
+        drafter.zero_grad(set_to_none=True)
+        total = 0.0
+        for group in groups:
+            batch = tr.collate(group, 0)
+            last, targets, scored = tr.a2_hidden(drafter, tr.target_states(target, batch), batch, 4)
+            loss, _ = tr.depth_loss(drafter, last, targets, scored, clusters, 0.7, 5, counts)
+            loss.backward()
+            total += float(loss.detach())
+        return total, [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in params]
+
+    # The reference: the whole batch at once, its own counts.
+    whole, reference = run([examples], None)
+    batch = tr.collate(examples, 0)
+    positions, valid = tr.query_positions(batch)
+    counts = [float(tr._targets(batch, positions, valid, 4)[1][:, :, k].sum()) for k in range(4)]
+    # By hand: the third rollout (11 tokens, start 4) drafts at q = 4 .. 9, depth k having 7 - k positions.
+    assert counts == [11 + 5 + 6, 10 + 4 + 5, 9 + 3 + 4, 8 + 2 + 3]
+    for groups in ([examples[:1], examples[1:]], [[e] for e in examples], [examples[:2], examples[2:]]):
+        total, grads = run(groups, counts)
+        assert total == pytest.approx(whole, rel=1e-12)                      # the forward is the batch's exactly
+        for got, want in zip(grads, reference, strict=True):
+            # Gemma 4's RMSNorm computes in float32 whatever its input's precision, and the backward sums its
+            # rows over a micro-batch instead of the batch: float32's rounding, relative to each gradient's scale
+            # (seen: 1.7e-7). A wrong normalisation would differ by a factor of order one.
+            assert float((got - want).abs().max()) <= 1e-5 * float(want.abs().max())
+
+
+def test_a_batch_that_runs_out_of_memory_is_run_again_in_halves(tiny, tmp_path):
+    from chat_vpa.train_e0 import EpochStream
+
+    examples = _three_sequences()
+
+    def trainer(fail_above=None, error=torch.cuda.OutOfMemoryError):
+        target, drafter = _models(tiny, torch.float64)
+        cfg = tr.TrainConfig(arm="a2", batch=3, steps=2, vocab_chunk=5).finish(len(examples))
+        made = tr.DrafterTrainer(cfg, target, drafter, drafter, EpochStream(examples, 0), 0, tmp_path,
+                                 torch.device("cpu"))
+        if fail_above is not None:
+            original = made.hidden
+
+            def hidden(batch):
+                if batch.ids.shape[0] > fail_above:
+                    raise error("CUDA out of memory (a stand-in)")
+                return original(batch)
+
+            made.hidden = hidden
+        return made
+
+    plain = trainer()
+    assert plain.micro_batch == 3                                     # A2: the whole batch, as timed
+    expected = [plain.train_step()["loss"] for _ in range(2)]
+    halved = trainer(fail_above=1)
+    rows = [halved.train_step() for _ in range(2)]
+    assert halved.micro_batch == 1 and halved.halvings == 1           # 3, then 3 // 2 = 1 for the rest of the run
+    assert [r["micro_batch"] for r in rows] == [1.0, 1.0]
+    assert rows[0]["loss"] == pytest.approx(expected[0], rel=1e-12)    # the same weights: the same forward
+    assert rows[1]["loss"] == pytest.approx(expected[1], rel=1e-5)
+    # The gradients agree to float32's rounding (Gemma 4's RMSNorm, above); AdamW moves an element by at most about
+    # lr per step, so an element whose gradient is near zero may move the other way: at most 2 lr per step apart.
+    for a, b in zip(plain.drafter.parameters(), halved.drafter.parameters(), strict=True):
+        assert float((a - b).detach().abs().max()) <= 2 * 2 * plain.cfg.lr * 1.01
+    with pytest.raises(ValueError, match="stand-in"):                 # anything else is not retried
+        trainer(fail_above=0, error=ValueError).train_step()
+
+
 def test_the_chunked_cross_entropy_is_the_full_one_with_its_gradients():
     generator = torch.Generator().manual_seed(9)
     hidden = torch.randn(11, 5, dtype=torch.float64, generator=generator, requires_grad=True)
@@ -363,7 +441,9 @@ def test_a3_0_trains_its_code_and_saves_the_realiser(tiny, rollouts, tmp_path):
     evals = [r for r in rows if "eval/hit_1" in r]
     assert [r["step"] for r in evals] == [0, 2] and all("eval/tokens_per_cycle_3" in r for r in evals)
     config = json.loads((tmp_path / "a3" / "config.json").read_text())
-    assert config["config"]["cluster_weight"] == 0.0                         # D8: the token's cross-entropy only
+    # A2's per-position loss, cluster term included (the author's decision of 27 November 2026), in micro-batches
+    # of at most 8.
+    assert config["config"]["cluster_weight"] == 1.0 and config["config"]["micro_batch"] == 2
     assert transformers.Gemma4AssistantForCausalLM.from_pretrained(tmp_path / "a3" / "final") is not None
 
 
@@ -400,6 +480,9 @@ def test_transformers_hands_its_drafter_only_the_accepted_prefixs_keys(tiny):
                                                 use_cache=False).shared_kv_states
         full = call["kv"]["full_attention"][0][:, :, :q + 1]
         assert full.shape[2] == q                                   # the keys of x_0 .. x_{q-1}, nothing at q
-        torch.testing.assert_close(full, clean["full_attention"][0], rtol=1e-5, atol=1e-6)
+        # float32's rounding between the cached passes and one fresh pass, relative to the keys' scale
+        torch.testing.assert_close(full, clean["full_attention"][0], rtol=1e-5,
+                                   atol=1e-5 * float(clean["full_attention"][0].abs().max()))
         sliding = call["kv"]["sliding_attention"][0][:, :, -(WINDOW + 1):]
-        torch.testing.assert_close(sliding, clean["sliding_attention"][0][:, :, -(WINDOW + 1):], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(sliding, clean["sliding_attention"][0][:, :, -(WINDOW + 1):], rtol=1e-5,
+                                   atol=1e-5 * float(clean["sliding_attention"][0].abs().max()))

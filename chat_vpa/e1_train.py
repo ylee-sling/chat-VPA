@@ -41,13 +41,18 @@ position q, under the same visibility; the slots cannot attend to each other (th
 of their own). ``code`` is one learned vector (A3-0 has no latent; A3-oracle and A3 put a codebook's vector in its
 place), initialised to the target's input embedding of the tokenizer's mask token (zero if it has none), as
 text-VPA's mask vector was; ``depth`` holds one learned vector per slot, zero at the start. Slot j is scored on
-x_{q+j} by A2's per-position loss, with ``cluster_weight`` 0 by default (D8 names the token's cross-entropy only);
-the slots weigh equally. Its weights start from ``--assistant`` (D4: A2's, or A1's if A2 accepts fewer tokens).
+x_{q+j} by A2's per-position loss, the cluster term included (the author's decision of 27 November 2026, so that
+A3-0's one change from A2 is the one call over B slots; docs/e1.md, Section 11.9); the slots weigh equally. Its
+weights start from ``--assistant`` (D4: A2's, or A1's if A2 accepts fewer tokens).
 
 **The target (S5, S8)**: frozen, bfloat16, without gradients. One pass of its text model over a batch gives every
 position's last hidden state and the keys and values the drafter attends to (recomputed in every step, not
 stored). The drafter's weights are float32. The vocabulary-wide cross-entropy runs over chunks of rows, each
-chunk's logits recomputed in the backward pass, so the logits of a batch never exist at once.
+chunk's logits recomputed in the backward pass, so the logits of a batch never exist at once. A batch can be run as
+micro-batches (``micro_batch``; A3-0's default is 8 of its 16) whose gradients add up to the batch's exactly: every
+depth's loss is divided by that depth's count over the whole batch, known before the pass. A batch that runs out of
+GPU memory is run again in micro-batches of half the size, which hold for the rest of the run; the step's gradient
+is the same either way.
 
 **Optimisation (S8)**: AdamW (0.9, 0.999) at 1e-4 without weight decay, linear warm-up over 3% of the steps and
 cosine decay to zero (``train.learning_rate``), gradients clipped at norm 1 (text-VPA's trainers; S8 does not
@@ -67,6 +72,7 @@ G = B for A3-0. They are counts along the continuations with the training pass's
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -321,16 +327,27 @@ def vocab_cross_entropy(hidden: Tensor, weight: Tensor, targets: Tensor, chunk: 
 
 
 def depth_loss(drafter: Any, last: Tensor, targets: Tensor, scored: Tensor, clusters: Tensor | None,
-               cluster_weight: float, chunk: int) -> tuple[Tensor, dict[str, list[float]]]:
+               cluster_weight: float, chunk: int, counts: Sequence[float] | None = None
+               ) -> tuple[Tensor, dict[str, list[float]]]:
     """The mean over depths (or slots) that have a scored position of (the token's cross-entropy over the
     vocabulary + ``cluster_weight`` x its cluster's cross-entropy), each averaged over its scored positions; per
-    depth, the sums and the count."""
+    depth, the sums and the count. ``counts``, the scored positions per depth of the whole batch when this is one of
+    its micro-batches, replace this one's own in both averages, so that the micro-batches' losses add up to the
+    batch's."""
     if cluster_weight and clusters is None:
         raise ValueError("a cluster loss needs a clustered output layer")
+    depths = last.shape[2]
+    if counts is None:
+        counts = [float(scored[:, :, k].sum()) for k in range(depths)]
+    if len(counts) != depths:
+        raise ValueError("one count per depth")
+    active = sum(1 for c in counts if c > 0)
+    if not active:
+        raise ValueError("no scored position in the batch")
     weight = drafter.lm_head.weight
-    losses: list[Tensor] = []
+    total = last.new_zeros(())
     stats: dict[str, list[float]] = {"count": [], "token_nll": [], "cluster_nll": []}
-    for k in range(last.shape[2]):
+    for k in range(depths):
         chosen = scored[:, :, k]
         n = int(chosen.sum())
         rows, tokens = last[:, :, k][chosen], targets[:, :, k][chosen]
@@ -342,10 +359,10 @@ def depth_loss(drafter: Any, last: Tensor, targets: Tensor, scored: Tensor, clus
         stats["token_nll"].append(float(token.detach()))
         stats["cluster_nll"].append(float(cluster.detach()))
         if n:
-            losses.append((token + cluster_weight * cluster) / n)
-    if not losses:
-        raise ValueError("no scored position in the batch")
-    return torch.stack(losses).mean(), stats
+            if counts[k] <= 0:
+                raise ValueError("a micro-batch scores a depth that the batch's counts leave out")
+            total = total + (token + cluster_weight * cluster) / counts[k]
+    return total / active, stats
 
 
 @torch.no_grad()
@@ -414,7 +431,8 @@ class TrainConfig:
     grad_clip: float = 1.0
     depths: int = 4                        # A2: G_train
     slots: int = 8                         # A3-0: B
-    cluster_weight: float = -1.0           # -1: the arm's own (A2 1.0, S7; A3-0 0.0, D8)
+    cluster_weight: float = 1.0            # S7's cluster term (A3-0 too: the author's decision of 27 November 2026)
+    micro_batch: int = 0                   # 0: the arm's own (A2: the whole batch, as timed; A3-0: 8)
     eval_depths: int = 8
     eval_every: int = 2_500
     save_every: int = 500
@@ -426,7 +444,10 @@ class TrainConfig:
         if self.arm not in ARMS:
             raise ValueError(f"arm must be one of {ARMS}")
         if self.cluster_weight < 0:
-            self.cluster_weight = 1.0 if self.arm == "a2" else 0.0
+            raise ValueError("cluster_weight must not be negative")
+        if self.micro_batch <= 0:
+            self.micro_batch = self.batch if self.arm == "a2" else min(self.batch, 8)
+        self.micro_batch = min(self.micro_batch, self.batch)
         if self.horizon_examples <= 0:
             self.horizon_examples = examples
         if self.steps <= 0:
@@ -448,6 +469,10 @@ class TrainConfig:
     def from_dict(cls, data: dict[str, Any]) -> TrainConfig:
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def _is_out_of_memory(error: BaseException) -> bool:
+    return isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error).lower()
 
 
 def learning_rate(step: int, cfg: TrainConfig) -> float:
@@ -495,6 +520,8 @@ class DrafterTrainer:
                                            weight_decay=cfg.weight_decay)
         self.step = 0
         self.step_seconds: list[float] = []
+        self.micro_batch = cfg.micro_batch
+        self.halvings = 0
 
     def hidden(self, batch: RolloutBatch) -> tuple[Tensor, Tensor, Tensor]:
         states = target_states(self.target, batch)
@@ -502,30 +529,70 @@ class DrafterTrainer:
             return a2_hidden(self.drafter, states, batch, self.cfg.depths)
         return self.module(states, batch)
 
+    def counts(self, examples: Sequence[dict[str, Any]]) -> list[float]:
+        """The scored positions per depth (or slot) of a batch, from its lengths alone."""
+        batch = collate(examples, self.pad_id)
+        positions, valid = query_positions(batch)
+        count = self.cfg.depths if self.cfg.arm == "a2" else self.cfg.slots
+        _, scored = _targets(batch, positions, valid, count)
+        return [float(scored[:, :, k].sum()) for k in range(count)]
+
+    def accumulate(self, examples: Sequence[dict[str, Any]], counts: Sequence[float]) -> dict[str, Any]:
+        """The batch's gradient in ``self.micro_batch``-sized parts, added up in the parameters' ``grad``."""
+        cfg = self.cfg
+        self.optimizer.zero_grad(set_to_none=True)
+        loss_total, positions, tokens = 0.0, 0, 0
+        sums = {"token_nll": [0.0] * len(counts), "cluster_nll": [0.0] * len(counts)}
+        for s in range(0, len(examples), self.micro_batch):
+            batch = collate(examples[s:s + self.micro_batch], self.pad_id).to(self.device)
+            last, targets, scored = self.hidden(batch)
+            loss, stats = depth_loss(self.drafter, last, targets, scored, self.clusters, cfg.cluster_weight,
+                                     cfg.vocab_chunk, counts)
+            if loss.requires_grad:
+                loss.backward()
+            loss_total += float(loss.detach())
+            for key in sums:
+                sums[key] = [a + b for a, b in zip(sums[key], stats[key], strict=True)]
+            positions += int(scored[:, :, 0].sum())
+            tokens += int(batch.valid.sum())
+            del last, targets, scored, loss
+        return {"loss": loss_total, "positions": positions, "tokens": tokens, **sums}
+
     def train_step(self) -> dict[str, float]:
         cfg = self.cfg
         lr = learning_rate(self.step, cfg)
         for group in self.optimizer.param_groups:
             group["lr"] = lr
         self.module.train()
-        self.optimizer.zero_grad(set_to_none=True)
-        batch = collate(self.stream.take(cfg.batch), self.pad_id).to(self.device)
-        last, targets, scored = self.hidden(batch)
-        loss, stats = depth_loss(self.drafter, last, targets, scored, self.clusters, cfg.cluster_weight,
-                                 cfg.vocab_chunk)
-        loss.backward()
+        examples = self.stream.take(cfg.batch)
+        counts = self.counts(examples)
+        while True:
+            try:
+                result = self.accumulate(examples, counts)
+                break
+            except Exception as error:                          # noqa: BLE001 - only out-of-memory is retried
+                if not _is_out_of_memory(error) or self.micro_batch == 1:
+                    raise
+            self.optimizer.zero_grad(set_to_none=True)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.micro_batch = max(1, self.micro_batch // 2)
+            self.halvings += 1
+            print(f"out of memory at step {self.step}: micro-batches of {self.micro_batch} from here on "
+                  "(the same gradient)", flush=True)
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters, cfg.grad_clip)
         if not bool(torch.isfinite(grad_norm)):
             raise FloatingPointError(f"non-finite gradient norm at step {self.step}")
         self.optimizer.step()
         self.step += 1
-        row: dict[str, float] = {"loss": float(loss.detach()), "lr": lr, "grad_norm": float(grad_norm),
-                                 "positions": float(int(scored[:, :, 0].sum())),
-                                 "tokens": float(int(batch.valid.sum()))}
-        for k, n in enumerate(stats["count"]):
+        row: dict[str, float] = {"loss": result["loss"], "lr": lr, "grad_norm": float(grad_norm),
+                                 "positions": float(result["positions"]), "tokens": float(result["tokens"]),
+                                 "micro_batch": float(self.micro_batch), "halvings": float(self.halvings)}
+        for k, n in enumerate(counts):
             if n:
-                row[f"token_nll_{k + 1}"] = stats["token_nll"][k] / n
-                row[f"cluster_nll_{k + 1}"] = stats["cluster_nll"][k] / n
+                row[f"token_nll_{k + 1}"] = result["token_nll"][k] / n
+                row[f"cluster_nll_{k + 1}"] = result["cluster_nll"][k] / n
         return row
 
     @torch.no_grad()
@@ -538,8 +605,8 @@ class DrafterTrainer:
         hits_clustered: list[list[list[bool]]] = []
         hits_overall: list[list[list[bool]]] = []
         sums = {"n": [0.0] * count, "clustered": [0.0] * count, "overall": [0.0] * count, "nll": [0.0] * count}
-        for s in range(0, len(self.held_out), cfg.batch):
-            batch = collate(self.held_out[s:s + cfg.batch], self.pad_id).to(self.device)
+        for s in range(0, len(self.held_out), self.micro_batch):
+            batch = collate(self.held_out[s:s + self.micro_batch], self.pad_id).to(self.device)
             states = target_states(self.target, batch)
             if cfg.arm == "a2":
                 last, targets, scored = a2_hidden(self.drafter, states, batch, count)

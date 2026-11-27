@@ -14,11 +14,13 @@ R5, 25 November 2026) ran on the server on 26 November 2026 and is read by its r
 Google's drafter pays clearly in PyTorch on the L4 (1.43x at G = 2 in bfloat16, where it is not token-identical;
 1.42x at G = 4 in float32, exact on its sample) and on the CPU (1.57x at G = 2, exact), gains 5% in LiteRT-LM, and
 vLLM's table is not read for R2 (its drift check excluded 1); R4 names A2 as Step 1's first trained arm and R5
-admits B1. Step 1 is registered and confirmed by the author (27 November 2026; `docs/e1.md`, Section 11): P2 first
-(LiteRT-LM's GPU exactness, `scripts/ncp/e1_p2.sh`), then the timing runs (`scripts/ncp/e1_step1.sh`: the rollout
-writer and A2's and A3-0's trainer are built and tested on the CPU), the rollouts (English first), A2 and A3, the
-author's block-latent drafter (Section 6.1, with the 2026 prior work in 6.2); B1 waits behind his sign-off after A2
-and A3. Nothing is trained before he confirms the GPU time the timing runs imply.** E1 leaves the preprint's
+admits B1. Step 1 is registered and confirmed by the author (27 November 2026; `docs/e1.md`, Section 11). P2 ran
+(LiteRT-LM's GPU exactness: undecided, as he reported it) and so did the timing runs (Section 11.8); he confirmed
+the budgets and chose the accepted-prefix arms beside the registered ones (S9 amended, R9) and the cluster term for
+A3-0. Next, in one run: the rest of the rollouts, A2's training, measurement and readings (`bash
+scripts/ncp/e1_step1.sh a2`, about 26 h predicted); A3-0 after he has reviewed A2's numbers (A3 is the author's
+block-latent drafter, Section 6.1, with the 2026 prior work in 6.2); B1 waits behind his sign-off after A2 and
+A3.** E1 leaves the preprint's
 protocol by the author's decision of 25 November 2026: drafting that the frozen `google/gemma-4-E2B-it` verifies
 exactly, measured against Google's own drafter for it; for E1, `docs/e1.md` holds where it and the preprint
 disagree. The code on `main` is text-VPA's verified Stage 0 code (`docs/provenance.md`). The first experiment is E0
@@ -58,7 +60,7 @@ author's decision of 25 November 2026 the B = 32 runs are not run (Section 9).
 | `chat_vpa/train_e0.py` | Secs. 3.3, 6.2, Eq. 12 | E0's trainer: text-VPA's Stage 0 loop with `collate_blocks`, `block_training_state` and `dfm_loss` behind its hooks; `RolloutData`, `EpochStream`; held-out L_DFM on both targets; checkpoints of stage `e0` (registers, the data's fingerprint), read by `block_evaluate` |
 | `scripts/ncp/` | | `env.sh` (the server's rules in one place), `stage0_sweep.sh` (the predecessor's sweep through the ported code), `rollout_throughput.sh` (`inspect` runs `inspect_rollouts.py` on its output), `port_check.sh` (the port against text-VPA's samples), `block_check.sh` (pass audit, cache check and seconds per block on the real weights; not a result), `first_checks.sh` (the three in one tmux session; `show` prints what the author pastes back), `e0_data.sh` (`check`: batch 128 against 256; then the data), `e0_train.sh` (one run of T16, R16, T32, R32; `STOP_AT=100` for the timing), `e0_eval.sh` (a run's final checkpoint, 6 configurations; `report`), `e0_all.sh` (the four runs in C12's order: train, evaluate, report) |
 | `chat_vpa/e1_common.py`, `e1_prompts.py` | | E1's Step 0 (`docs/e1.md`, Section 3; not in the preprint): the released E2B-it for text, the chat prompt (one user turn, thinking off), the record of where a number was measured (torch imported lazily: `e1_litert.py` runs without it); the development prompts (the first qualifying first turns of UltraChat-200K `test_sft`) |
-| `chat_vpa/e1_decode.py` | | Step 0 in Transformers: greedy `generate` alone (`ar`), with Google's drafter (`mtp:G`) and with prompt lookup (`lookup:G`); passes counted with hooks; decode and end-to-end tok/s, tokens per cycle, exactness against `ar`, paired-bootstrap speed-ups; `--profile` |
+| `chat_vpa/e1_decode.py` | | Step 0 in Transformers: greedy `generate` alone (`ar`), with Google's drafter (`mtp:G`) and with prompt lookup (`lookup:G`); passes counted with hooks; decode and end-to-end tok/s, tokens per cycle, exactness against `ar`, paired-bootstrap speed-ups; `--profile`. Step 1: drafters by label (`--drafter a2=PATH`, arms `a2:G`) and arms whose drafter sees only the accepted prefix's keys (`a2:G:clean`) |
 | `chat_vpa/e1_ceiling.py` | | the time of one target pass over n positions, the ceiling n t(1) / t(n), the predicted speed-up of a free drafter at acceptance alpha; where a pass over n tokens and n passes choose different tokens |
 | `chat_vpa/e1_bridge.py` | | E0's checkpoints as block drafters under greedy verification along the backbone's greedy continuation: accepted tokens per cycle, tokens per backbone pass (passes counted, not timed); the committed-stream check |
 | `chat_vpa/e1_litert.py` | | Step 0 in LiteRT-LM (its own environment, no torch): speculative decoding off, on, adaptive at lenience 0; a mode that cannot start is recorded and the others are measured |
@@ -68,7 +70,8 @@ author's decision of 25 November 2026 the B = 32 runs are not run (Section 9).
 | `chat_vpa/e1_p2.py`, `scripts/ncp/e1_p2.sh` | | Step 1's P2 (`docs/e1.md`, Section 11.7): `run`, one LiteRT-LM engine of one mode per process (LiteRT-LM's environment, no torch); `read`, the texts of the runs compared, the first token at which two responses part scored by the target in float32, the registered rule applied; the script runs off-a, on-a, off-b, on-b in tmux (`show`: the reading) |
 | `chat_vpa/e1_rollouts.py` | | Step 1's data (`docs/e1.md`, Section 11.3): the qualifying `train_sft` first turns by number; the target's own greedy rollouts, batched in bfloat16, in resumable chunks (the batch halved on out-of-memory); the training prompts that are development prompts, counted; `summary` with the measured rate |
 | `chat_vpa/e1_train.py` | | Step 1's A2 and A3-0 (Sections 11.4, 11.5): the frozen target's pass without gradients; Google's drafter unrolled over 4 depths on the accepted path (A2) or called once over 8 slots with a learned code (A3-0), with the keys of Transformers' first cycle; token and cluster cross-entropy over the vocabulary in chunks; held-out curves; `RUN/final` as a `Gemma4AssistantForCausalLM` directory; `--stop-at` for the timing |
-| `scripts/ncp/e1_step1.sh` | | Step 1's timing runs (Section 11.8) in tmux: the writer's first chunk, 100 steps each of A2 and A3-0 (`show`: what the author pastes back); `e1_setup.sh train-data` downloads `train_sft` |
+| `chat_vpa/e1_readings.py` | | Step 1's readings (Section 11.4): R1, R2, R6, R7, R9 over a PyTorch decode table's records; S11, R1, R2, R7 over vLLM's; `best` gives a drafter's best G for the next table |
+| `scripts/ncp/e1_step1.sh` | | Step 1 on the L4: the timing runs (Section 11.8; `show`), and `a2`, A2's whole run in tmux: rollouts, training, the measurement of S9 (A1 and A2, the accepted-prefix arms), the readings (`show-a2`); `e1_setup.sh train-data` downloads `train_sft` |
 | `docs/e1.md` | | the pre-registration of E1 (Step 0 confirmed and frozen, 25 November 2026): the question and the author's decisions, setup and preflight, Step 0's measurements and timing rules, reading rules R1 to R5, choices C1 to C11; Step 1 as a sketch with A3's design (D1 to D8, its oracle and break-even gates) and the prior work on block latents; what could not be tested off the server; Step 0's tables and their readings (Section 10); Step 1's draft registration, S1 to S14 with A3's D1 to D8 (Section 11) |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
@@ -261,6 +264,10 @@ C9).
   attention; a batched call under it reproduces Transformers' single-query call (tested). Transformers 5.21 hands
   its drafter rejected drafts' keys after a partly accepted cycle; a strict `xfail` test keeps that in view, and
   the author decides what the PyTorch tables do about it (`docs/e1.md`, Section 11.9).
+- **A batch of the drafters' trainer can run as micro-batches** whose losses are divided by the whole batch's counts,
+  so their gradients add up to the batch's (`e1_train.depth_loss`, tested); A3-0 uses micro-batches of 8, and a
+  batch that runs out of GPU memory is run again in halves. Gemma 4's RMSNorm computes in float32 whatever its
+  input's precision, so in float64 tests gradients through it agree to float32's rounding only.
 - **In bfloat16 the model's own `generate` and this repository's realizer path can choose different tokens**
   (2 of 48 positions on the tests' tiny model; none in float32): a check of exact equality between two code
   paths is made in float32, or its bfloat16 result is reported as a measurement.
