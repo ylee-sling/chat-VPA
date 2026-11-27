@@ -15,23 +15,22 @@ Google's drafter pays clearly in PyTorch on the L4 (1.43x at G = 2 in bfloat16, 
 1.42x at G = 4 in float32, exact on its sample) and on the CPU (1.57x at G = 2, exact), gains 5% in LiteRT-LM, and
 vLLM's table is not read for R2 (its drift check excluded 1); R4 names A2 as Step 1's first trained arm and R5
 admits B1. Step 1 is registered and confirmed by the author (27 November 2026; `docs/e1.md`, Section 11). P2 ran
-(LiteRT-LM's GPU exactness: undecided, as he reported it) and so did the timing runs (Section 11.8); he confirmed
-the budgets and chose the accepted-prefix arms beside the registered ones (S9 amended, R9) and the cluster term for
-A3-0. Next, in one run: the rest of the rollouts, A2's training, measurement and readings (`bash
-scripts/ncp/e1_step1.sh a2`, about 26 h predicted); A3-0 after he has reviewed A2's numbers (A3 is the author's
-block-latent drafter, Section 6.1, with the 2026 prior work in 6.2); B1 waits behind his sign-off after A2 and
-A3.** E1 leaves the preprint's
-protocol by the author's decision of 25 November 2026: drafting that the frozen `google/gemma-4-E2B-it` verifies
-exactly, measured against Google's own drafter for it; for E1, `docs/e1.md` holds where it and the preprint
-disagree. The code on `main` is text-VPA's verified Stage 0 code (`docs/provenance.md`). The first experiment is E0
-(preprint Sec. 6.2), developed on branch `e0`: the Block-DFM core, its tests, the rollout generator and the checks
-for the L4 exist, and the checks have run (the port is exact: `docs/e0.md`, Section 2.4). The author has confirmed
-all of `docs/e0.md` (C1 to C12, 23 November 2026); it is frozen, and a later change is a deviation recorded in its
-Section 9. The rollout writer, the E0 trainer, the evaluation script and the report exist and are tested on the CPU
-with the tiny model. The writer has run on the L4 and E0's training data is written (`docs/e0.md`, Section 4). T16
-and R16 are trained and evaluated: H1 clearly fails (Pass@1 0.4% [0.0, 1.1] at (16, 4), 1.9% of the AR baseline),
-arm R is at the floor, and by Section 5.4 the preprint's student is not trained (`docs/e0.md`, Section 10). By the
-author's decision of 25 November 2026 the B = 32 runs are not run (Section 9).
+(LiteRT-LM's GPU exactness: undecided, 4 near ties and 4 far of 77 partings) and so did the timing runs (Section
+11.8); he confirmed the budgets and chose the accepted-prefix arms beside the registered ones (S9 amended, R9) and
+the cluster term for A3-0. Next, in one run: the rest of the rollouts, A2's training, measurement and readings
+(`bash scripts/ncp/e1_step1.sh a2`, about 26 h predicted); A3-0 after he has reviewed A2's numbers (A3 is the
+author's block-latent drafter, Section 6.1, with the 2026 prior work in 6.2); B1 waits behind his sign-off after A2
+and A3.** E1 leaves the preprint's protocol by the author's decision of 25 November 2026: drafting that the frozen
+`google/gemma-4-E2B-it` verifies exactly, measured against Google's own drafter for it; for E1, `docs/e1.md` holds
+where it and the preprint disagree. The code on `main` is text-VPA's verified Stage 0 code (`docs/provenance.md`).
+The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the Block-DFM core, its tests, the rollout
+generator and the checks for the L4 exist, and the checks have run (the port is exact: `docs/e0.md`, Section 2.4).
+The author has confirmed all of `docs/e0.md` (C1 to C12, 23 November 2026); it is frozen, and a later change is a
+deviation recorded in its Section 9. The rollout writer, the E0 trainer, the evaluation script and the report exist
+and are tested on the CPU with the tiny model. The writer has run on the L4 and E0's training data is written
+(`docs/e0.md`, Section 4). T16 and R16 are trained and evaluated: H1 clearly fails (Pass@1 0.4% [0.0, 1.1] at (16,
+4), 1.9% of the AR baseline), arm R is at the floor, and by Section 5.4 the preprint's student is not trained
+(`docs/e0.md`, Section 10). By the author's decision of 25 November 2026 the B = 32 runs are not run (Section 9).
 
 ## Layout
 
