@@ -17,10 +17,14 @@ vLLM's table is not read for R2 (its drift check excluded 1); R4 names A2 as Ste
 admits B1. Step 1 is registered and confirmed by the author (27 November 2026; `docs/e1.md`, Section 11). P2 ran
 (LiteRT-LM's GPU exactness: undecided, 4 near ties and 4 far of 77 partings) and so did the timing runs (Section
 11.8); he confirmed the budgets and chose the accepted-prefix arms beside the registered ones (S9 amended, R9) and
-the cluster term for A3-0. Next, in one run: the rest of the rollouts, A2's training, measurement and readings
-(`bash scripts/ncp/e1_step1.sh a2`, about 26 h predicted); A3-0 after he has reviewed A2's numbers (A3 is the
-author's block-latent drafter, Section 6.1, with the 2026 prior work in 6.2); B1 waits behind his sign-off after A2
-and A3.** E1 leaves the preprint's protocol by the author's decision of 25 November 2026: drafting that the frozen
+the cluster term for A3-0. A2's run finished on 28 November 2026 (Section 11.11): A2 is exact wherever A1 is
+(float32), accepts more at every G (R6), and pays over A1 clearly in all four tables (R7: 1.058x in PyTorch on the
+L4 in float32, where it decodes 1.536x the model alone at G = 4; 1.089x in vLLM). Next: A3-0 (A3 is the author's
+block-latent drafter, Section 6.1, with the 2026 prior work in 6.2), once he has named its slot input (Section
+11.12: D4 as registered hides the cycle's last token from every slot; `bash scripts/ncp/e1_step1.sh a3 add` or
+`a3 replace`, about 21 h predicted, the float32 break-even first); P3's inspection and byte-level null test of
+LiteRT-LM's file run beside it without the GPU (`bash scripts/ncp/e1_p3.sh`, Section 11.7); B1 waits behind his
+sign-off after A2 and A3.** E1 leaves the preprint's protocol by the author's decision of 25 November 2026: drafting that the frozen
 `google/gemma-4-E2B-it` verifies exactly, measured against Google's own drafter for it; for E1, `docs/e1.md` holds
 where it and the preprint disagree. The code on `main` is text-VPA's verified Stage 0 code (`docs/provenance.md`).
 The first experiment is E0 (preprint Sec. 6.2), developed on branch `e0`: the Block-DFM core, its tests, the rollout
@@ -68,9 +72,11 @@ and are tested on the CPU with the tiny model. The writer has run on the L4 and 
 | `scripts/ncp/e1_setup.sh`, `e1_step0.sh` | | E1's downloads, the three environments and the preflight (`show` prints what the author pastes back); Step 0's five parts in tmux (bridge, ceiling, decode, litert, vllm), each skipped once done (`show`: the tables) |
 | `chat_vpa/e1_p2.py`, `scripts/ncp/e1_p2.sh` | | Step 1's P2 (`docs/e1.md`, Section 11.7): `run`, one LiteRT-LM engine of one mode per process (LiteRT-LM's environment, no torch); `read`, the texts of the runs compared, the first token at which two responses part scored by the target in float32, the registered rule applied; the script runs off-a, on-a, off-b, on-b in tmux (`show`: the reading) |
 | `chat_vpa/e1_rollouts.py` | | Step 1's data (`docs/e1.md`, Section 11.3): the qualifying `train_sft` first turns by number; the target's own greedy rollouts, batched in bfloat16, in resumable chunks (the batch halved on out-of-memory); the training prompts that are development prompts, counted; `summary` with the measured rate |
-| `chat_vpa/e1_train.py` | | Step 1's A2 and A3-0 (Sections 11.4, 11.5): the frozen target's pass without gradients; Google's drafter unrolled over 4 depths on the accepted path (A2) or called once over 8 slots with a learned code (A3-0), with the keys of Transformers' first cycle; token and cluster cross-entropy over the vocabulary in chunks; held-out curves; `RUN/final` as a `Gemma4AssistantForCausalLM` directory; `--stop-at` for the timing |
-| `chat_vpa/e1_readings.py` | | Step 1's readings (Section 11.4): R1, R2, R6, R7, R9 over a PyTorch decode table's records; S11, R1, R2, R7 over vLLM's; `best` gives a drafter's best G for the next table |
-| `scripts/ncp/e1_step1.sh` | | Step 1 on the L4: the timing runs (Section 11.8; `show`), and `a2`, A2's whole run in tmux: rollouts, training, the measurement of S9 (A1 and A2, the accepted-prefix arms), the readings (`show-a2`); `e1_setup.sh train-data` downloads `train_sft` |
+| `chat_vpa/e1_train.py` | | Step 1's A2 and A3-0 (Sections 11.4, 11.5, 11.12): the frozen target's pass without gradients; Google's drafter unrolled over 4 depths on the accepted path (A2) or called once over 8 slots with a learned code (A3-0; `slot_input` replace or add), with the keys of Transformers' first cycle; token and cluster cross-entropy over the vocabulary in chunks; held-out curves (`choice_hits`); `RUN/final` as a `Gemma4AssistantForCausalLM` directory (A3-0: and `realiser.pt`, `load_realiser`); `--stop-at` for the timing |
+| `chat_vpa/e1_readings.py` | | Step 1's readings (Section 11.4): R1, R2, R6, R7, R9 over a PyTorch decode table's records; S11, R1, R2, R7 over vLLM's; `best` gives a drafter's best G for the next table; `breakeven`, A3's bar of Section 6.1 from a table and the ceiling of the same runtime and precision (the call time fitted as Section 10.3 did) |
+| `chat_vpa/e1_count.py` | | Step 1's counts (Sections 6.1, 11.12): tokens per cycle of sequential drafters and A3 realisers along a decode table's own greedy continuations of the development prompts, with the accepted prefix's keys; differences with paired bootstraps; what the oracle gate reads |
+| `chat_vpa/e1_p3.py`, `scripts/ncp/e1_p3.sh` | | Step 1's P3 (Section 11.7), in LiteRT-LM's environment, CPU and disk only: `inspect`, the model file's sections, graphs, signatures, quantisation and the drafter's tensors against A1's weights; `repack`, the builder's unpack and pack compared section by section (`show`: both reports) |
+| `scripts/ncp/e1_step1.sh` | | Step 1 on the L4: the timing runs (Section 11.8; `show`); `a2`, A2's whole run in tmux: rollouts, training, the measurement of S9 (A1 and A2, the accepted-prefix arms), the readings (`show-a2`); `breakeven`; `a3 add` or `a3 replace`, A3-0's run (the bar, the training from A2's weights, the counts; `show-a3`); `e1_setup.sh train-data` downloads `train_sft` |
 | `docs/e1.md` | | the pre-registration of E1 (Step 0 confirmed and frozen, 25 November 2026): the question and the author's decisions, setup and preflight, Step 0's measurements and timing rules, reading rules R1 to R5, choices C1 to C11; Step 1 as a sketch with A3's design (D1 to D8, its oracle and break-even gates) and the prior work on block latents; what could not be tested off the server; Step 0's tables and their readings (Section 10); Step 1's draft registration, S1 to S14 with A3's D1 to D8 (Section 11) |
 | `docs/e0.md` | Secs. 6.2, 6.4 | the pre-registration of E0: the checks before the run and their reading rules, the open choices C1 to C12, H1 to H3 verbatim, the table E0 fills, the decision record |
 | `docs/preprint-corrections.md` | | what to raise at the preprint's next revision |
@@ -263,6 +269,13 @@ C9).
   attention; a batched call under it reproduces Transformers' single-query call (tested). Transformers 5.21 hands
   its drafter rejected drafts' keys after a partly accepted cycle; a strict `xfail` test keeps that in view, and
   the author decides what the PyTorch tables do about it (`docs/e1.md`, Section 11.9).
+- **A3's bar in float32** (Section 11.12) uses Step 0's float32 ceiling with Step 1's float32 decode table, and a
+  drafter call's time fitted from the table as Section 10.3, item 1, fitted it in bfloat16 (`e1_readings.break_even`
+  reproduces item 1 and item 6 from Section 10.1's numbers: tested). The bar against A2 is the author's request of
+  28 November 2026 and stands beside the registered gate against A1.
+- **Counts along the development prompts' continuations** (`e1_count.py`) use the `ar` responses of the decode
+  table they are read beside, and the accepted prefix's keys at every position (the trainer's), so the clean arms'
+  measured tokens per cycle check them.
 - **A batch of the drafters' trainer can run as micro-batches** whose losses are divided by the whole batch's counts,
   so their gradients add up to the batch's (`e1_train.depth_loss`, tested); A3-0 uses micro-batches of 8, and a
   batch that runs out of GPU memory is run again in halves. Gemma 4's RMSNorm computes in float32 whatever its

@@ -242,3 +242,93 @@ def test_the_vllm_readings_follow_the_drift_rule(tmp_path):
     assert rd.main(["read", "--tables", str(_table(tmp_path / "t", PLAN)), "--vllm", str(tmp_path / "in"),
                     "--out", str(tmp_path / "r")]) == 0
     assert (tmp_path / "r" / "readings.md").read_text().count("## ") == 2
+
+
+# ---------------------------------------------------------------------------------------------
+# A3's break-even (docs/e1.md, Sections 6.1 and 10.3) against Step 0's own computation by hand
+# ---------------------------------------------------------------------------------------------
+
+STEP0_BF16 = {"rates": {2: 29.7, 4: 28.9, 6: 26.5, 8: 24.2}, "tau": {2: 1.88, 4: 2.12, 6: 2.21, 8: 2.24},
+              "speedup": {2: 1.43, 4: 1.39, 6: 1.28, 8: 1.17},
+              "t_ms": {1: 48.72, 2: 53.10, 3: 53.17, 4: 53.41, 5: 53.40, 6: 53.40, 8: 53.65, 12: 53.62, 16: 53.62,
+                       24: 53.83, 32: 53.86}}
+
+
+def _break_even_inputs(tmp_path, label="mtp", gpu="NVIDIA L4", dtype="bf16"):
+    """Step 0's bfloat16 decode table and ceiling as Section 10.1 prints them (rounded)."""
+    environment = {"device": "cuda", "gpu": gpu, "dtype": dtype, "runtime": "PyTorch, eager"}
+    arms = {"ar": {"prompts": 100, "decode_tokens_per_second": 20.7, "tokens_per_cycle": 1.0}}
+    for g, rate in STEP0_BF16["rates"].items():
+        arms[f"{label}-{g}"] = {"prompts": 100, "decode_tokens_per_second": rate, "tokens_per_cycle":
+                                STEP0_BF16["tau"][g], "decode_speedup": STEP0_BF16["speedup"][g]}
+    table, ceiling = tmp_path / "decode", tmp_path / "ceiling"
+    table.mkdir(parents=True, exist_ok=True)
+    ceiling.mkdir(parents=True, exist_ok=True)
+    (table / "summary.json").write_text(json.dumps({"environment": environment, "max_new_tokens": 256, "arms": arms}))
+    rows = [{"n": n, "seconds": t / 1e3} for n, t in STEP0_BF16["t_ms"].items()]
+    (ceiling / "summary.json").write_text(json.dumps({"environment": {**environment, "gpu": "NVIDIA L4"},
+                                                      "rows": rows}))
+    return table, ceiling
+
+
+def test_the_break_even_is_step_0s_hand_computation(tmp_path):
+    table, ceiling = _break_even_inputs(tmp_path)
+    r = rd.break_even(table, ceiling, references=("mtp",), blocks=(2, 4, 8, 16))
+    # Section 10.3, item 1: cycles of 63.30, 73.36, 83.40 and 92.56 ms; without t(G + 1) (t(7) and t(9)
+    # interpolated), 0.65 ms + 4.81 ms x G remain, residuals within 0.34 ms.
+    cycles = {a["g"]: a["cycle_ms"] for a in r["arms"]}
+    assert [round(cycles[g], 2) for g in (2, 4, 6, 8)] == [63.30, 73.36, 83.40, 92.56]
+    passes = {a["g"]: (a["pass_ms"], a["pass_interpolated"]) for a in r["arms"]}
+    assert passes[6] == (pytest.approx((53.40 + 53.65) / 2), True)             # t(7), halfway between 6 and 8
+    assert passes[8] == (pytest.approx(53.65 + (53.62 - 53.65) / 4), True)     # t(9), a quarter of 8 to 12
+    assert passes[2] == (pytest.approx(53.17), False)
+    fit = r["fits"]["mtp"]
+    assert round(fit["call_ms"], 2) == 4.81 and round(fit["intercept_ms"], 2) == 0.65
+    assert max(abs(x) for x in fit["residuals_ms"]) < 0.34
+    assert round(fit["call_over_t1"], 3) == 0.099
+    # Item 6: G* = 2, tau_1 = 1.88, T_1 = 63.30 ms, D_1 = 2 calls, D_3 = 1.25 calls: tau* = 1.77 at B = 2, 1.78 at
+    # B = 4 and 1.79 at B = 8 and at B = 16.
+    bar = r["bars"][0]
+    assert bar["registered"] and bar["g"] == 2 and bar["tau"] == 1.88
+    assert bar["drafter_ms"] == pytest.approx(2 * fit["call_ms"]) and bar["a3_drafting_ms"] == pytest.approx(
+        1.25 * fit["call_ms"])
+    assert [round(x["tau_star"], 2) for x in bar["by_block"]] == [1.77, 1.78, 1.79, 1.79]
+    # The formula by hand at B = 8: 1.88 (T_1 - D_1 + D_3 + t(9) - t(3)) / T_1.
+    t1, d = 1.88 / 29.7 * 1e3, fit["call_ms"]
+    by_hand = 1.88 * (t1 - 2 * d + 1.25 * d + (53.65 - 0.03 / 4) - 53.17) / t1
+    assert bar["by_block"][2]["tau_star"] == pytest.approx(by_hand)
+    assert r["gate"]["blocked"] == [] and "does not stop A3" in r["gate"]["reading"]
+    text = rd.render_break_even(r)
+    assert "| mtp (the registered gate) | 2 | 1.880 | 63.30 |" in text and "*i*" in text
+
+
+def test_the_break_even_refuses_costs_from_another_precision_and_marks_a_blocked_gate(tmp_path):
+    table, ceiling = _break_even_inputs(tmp_path, dtype="fp32")
+    summary = json.loads((ceiling / "summary.json").read_text())
+    summary["environment"]["dtype"] = "bf16"
+    (ceiling / "summary.json").write_text(json.dumps(summary))
+    with pytest.raises(ValueError, match="different dtype"):
+        rd.break_even(table, ceiling, references=("mtp",))
+    # A pass over B + 1 positions far dearer than anything the cycle saves: t(24) = 10 s puts t(17) at 1.30 s, so the
+    # bar at B = 16 lies above 17 tokens per cycle and the gate stops A3 there; the fit (G + 1 <= 9) is untouched.
+    table, ceiling = _break_even_inputs(tmp_path / "dear")
+    summary = json.loads((ceiling / "summary.json").read_text())
+    for row in summary["rows"]:
+        if row["n"] == 24:
+            row["seconds"] = 10.0
+    (ceiling / "summary.json").write_text(json.dumps(summary))
+    r = rd.break_even(table, ceiling, references=("mtp",), blocks=(8, 16))
+    d, t1 = r["fits"]["mtp"]["call_ms"], 1.88 / 29.7 * 1e3
+    t17 = 53.62 + (10_000 - 53.62) / 8
+    assert r["bars"][0]["by_block"][1]["tau_star"] == pytest.approx(1.88 * (t1 - 0.75 * d + t17 - 53.17) / t1)
+    assert r["bars"][0]["by_block"][1]["tau_star"] > 17 and r["gate"]["blocked"] == [16]
+    assert "no drafter of A3's kind can pay there" in r["gate"]["reading"]
+    assert rd.main(["breakeven", "--table", str(table), "--ceiling", str(ceiling), "--against", "mtp",
+                    "--out", str(tmp_path / "out")]) == 0
+    assert json.loads((tmp_path / "out" / "breakeven.json").read_text())["bars"][0]["against"] == "mtp"
+    with pytest.raises(SystemExit, match="two draft lengths"):
+        rd.main(["breakeven", "--table", str(table), "--ceiling", str(ceiling), "--against", "a9",
+                 "--out", str(tmp_path / "out")])
+    assert rd.pass_seconds([{"n": 1, "seconds": 1.0}, {"n": 3, "seconds": 2.0}], 2) == (1.5, True)
+    with pytest.raises(ValueError, match="neither measured"):
+        rd.pass_seconds([{"n": 1, "seconds": 1.0}, {"n": 3, "seconds": 2.0}], 4)

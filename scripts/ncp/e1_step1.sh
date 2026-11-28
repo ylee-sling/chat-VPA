@@ -12,6 +12,16 @@
 #                                         accepted-prefix arms) and the readings; about 26 hours (predicted)
 #   bash scripts/ncp/e1_step1.sh run-a2   the same in the foreground
 #   bash scripts/ncp/e1_step1.sh show-a2  where it stands, and the readings once they exist; no GPU
+#   bash scripts/ncp/e1_step1.sh breakeven
+#                                         A3's break-even from A2's float32 table and Step 0's float32 ceiling
+#                                         (docs/e1.md, Sections 6.1, 11.5, 11.12): raw rates, cycle times, the
+#                                         drafter's call time and tau* against A1 (the gate) and A2; no GPU, seconds
+#   bash scripts/ncp/e1_step1.sh a3 add   A3-0 in tmux (session e1-a3), its slot input named: "add" (x_q's
+#   bash scripts/ncp/e1_step1.sh a3 replace  embedding kept, the code added) or "replace" (D4 as registered); the
+#                                         break-even, A3-0's training from A2's weights (D4) and the counts along the
+#                                         development prompts' continuations; about 21 hours (predicted)
+#   bash scripts/ncp/e1_step1.sh run-a3 add   the same in the foreground
+#   bash scripts/ncp/e1_step1.sh show-a3  where it stands, the break-even and the counts; no GPU
 #
 # A2's parts, each skipped once done, so the command can be given again after a failure:
 #   rollouts  chat_vpa/e1_rollouts.py: the training prompts 0 to 99,999 (resuming after the timing run's first
@@ -24,6 +34,15 @@
 #             THREADS threads, 20 x 128 (ar, both at G = 2, 4), if CPU_FP32_GIB GiB are free; vLLM (a smoke
 #             decode of A2, then off-1, both at G = 2, 4, 6, 8, off-2)
 #   read      chat_vpa/e1_readings.py: R1, R2, R6, R7, R9 and S11 on those tables (runs/e1-step1/measure/readings.md)
+#
+# A3-0's parts (A3_PARTS), each skipped once done:
+#   breakeven  chat_vpa/e1_readings.py breakeven on runs/e1-step1/measure/l4-fp32 and runs/e1-step0/ceiling/gpu-fp32:
+#              the bar fixed before A3-0 trains (runs/e1-step1/breakeven/breakeven.md)
+#   train      chat_vpa/e1_train.py --arm a3-0 (D4, D6, D8; Section 11.12): 12,500 steps of 16 rollouts in
+#              micro-batches of 8, the cluster term at weight 1, from A2's final weights unless R6 found A2
+#              accepting fewer tokens than A1 in the float32 table (then from A1's); held-out curves every 2,500 steps
+#   count      chat_vpa/e1_count.py: A1, A2 and A3-0 counted along the float32 table's continuations of the
+#              development prompts (runs/e1-step1/count/a3-0/count.md); counted, not timed
 #
 # 1. the rollout writer (chat_vpa/e1_rollouts.py) on the first chunk of 2,048 of the 100,000 training prompts:
 #    the first chunk of the full run, which resumes after it; it also counts the training prompts that are the
@@ -44,10 +63,11 @@
 #   PARTS ["rollouts train measure read"]   THREADS [4]   CPU_FP32_GIB [24]   MEASURE_PROMPTS [100]   MAX_NEW [256]
 #   MAIN_ARMS ["ar a1:2 a2:2 a1:4 a2:4 a1:4:clean a2:4:clean a1:6 a2:6 a1:8 a2:8"]   CPU_PROMPTS [20]
 #   CPU_MAX_NEW [128]   CPU_ARMS ["ar a1:2 a2:2 a1:4 a2:4"]   VLLM_LENGTHS ["2 4 6 8"]   VLLM_TIMEOUT [7200]
-#   EXTRA_DECODE [], EXTRA_VLLM [] (dry runs)
+#   EXTRA_DECODE [], EXTRA_VLLM [] (dry runs)   A3_PARTS ["breakeven train count"]   STEP0 [runs/e1-step0]
+#   EXTRA_COUNT [] (dry runs)
 # A part that has finished is skipped. Never shuts the server down. Do not git pull while it runs.
 set -euo pipefail
-PASS_VARS="OUT ASSETS TRAIN_PROMPTS HELD_OUT BATCH_SIZE STOP_AT TIMING_EVAL EXTRA_TRAIN PARTS THREADS CPU_FP32_GIB MEASURE_PROMPTS MAX_NEW MAIN_ARMS CPU_PROMPTS CPU_MAX_NEW CPU_ARMS VLLM_LENGTHS VLLM_TIMEOUT EXTRA_DECODE EXTRA_VLLM SESSION"
+PASS_VARS="OUT ASSETS TRAIN_PROMPTS HELD_OUT BATCH_SIZE STOP_AT TIMING_EVAL EXTRA_TRAIN PARTS THREADS CPU_FP32_GIB MEASURE_PROMPTS MAX_NEW MAIN_ARMS CPU_PROMPTS CPU_MAX_NEW CPU_ARMS VLLM_LENGTHS VLLM_TIMEOUT EXTRA_DECODE EXTRA_VLLM A3_PARTS STEP0 EXTRA_COUNT SESSION"
 # shellcheck source=scripts/ncp/env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
@@ -73,8 +93,12 @@ VLLM_LENGTHS="${VLLM_LENGTHS:-2 4 6 8}"
 VLLM_TIMEOUT="${VLLM_TIMEOUT:-7200}"
 EXTRA_DECODE="${EXTRA_DECODE:-}"
 EXTRA_VLLM="${EXTRA_VLLM:-}"
+A3_PARTS="${A3_PARTS:-breakeven train count}"
+STEP0="$(runs_dir "${STEP0:-runs/e1-step0}")"
+EXTRA_COUNT="${EXTRA_COUNT:-}"
 case "$ACTION" in
   a2|run-a2|show-a2) SESSION="${SESSION:-e1-a2}" ;;
+  a3|run-a3|show-a3) SESSION="${SESSION:-e1-a3}" ;;
   *)                 SESSION="${SESSION:-e1-timing}" ;;
 esac
 IT_MODEL="$ASSETS/models/gemma-4-E2B-it"
@@ -84,6 +108,7 @@ TRAIN_DATA="$ASSETS/data/ultrachat_200k_train"
 ROLLOUTS="$OUT/rollouts/train"
 HELD="$OUT/rollouts/held-out"
 A2="$OUT/a2"
+A3="$OUT/a3-0"
 MEASURE="$OUT/measure"
 VLLM_PY="$ASSETS/venvs/vllm/bin/python"
 
@@ -376,6 +401,109 @@ if (measure / "readings.md").exists():
 PYEOF
 }
 
+# ---------------------------------------------------------------------------------------------
+# A3-0: the break-even, the training and the counts (docs/e1.md, Section 11.12)
+# ---------------------------------------------------------------------------------------------
+
+breakeven() {
+  [[ -f "$MEASURE/l4-fp32/summary.json" ]] || die "A2's float32 table is missing: bash scripts/ncp/e1_step1.sh a2"
+  [[ -f "$STEP0/ceiling/gpu-fp32/summary.json" ]] || die "Step 0's float32 ceiling is missing under $STEP0"
+  step "$OUT/breakeven" hard "$PY" -m chat_vpa.e1_readings breakeven --table "$MEASURE/l4-fp32" \
+    --ceiling "$STEP0/ceiling/gpu-fp32" --against a1 a2 --out "$OUT/breakeven"
+}
+
+# a3_start: D4's rule, applied to the float32 readings: A2's weights unless R6 found A2 accepting fewer tokens.
+a3_start() {
+  "$PY" - "$MEASURE/readings.json" "$MEASURE/l4-fp32" <<'PYEOF'
+import json, sys
+readings = json.load(open(sys.argv[1], encoding="utf-8"))
+table = next(r for r in readings if r["table"].rstrip("/").endswith("l4-fp32"))
+fewer = [x for x in table["r6"] if x["reading"].endswith("accepts fewer")]
+print("a1" if fewer else "a2")
+PYEOF
+}
+
+train_a3() {
+  local variant="$1" start source sets=("slot_input=$variant") more=()
+  [[ -f "$ROLLOUTS/.done" && -f "$HELD/.done" ]] || die "the rollouts are not written: bash scripts/ncp/e1_step1.sh a2"
+  [[ -f "$A2/final/config.json" && -f "$MEASURE/readings.json" ]] || die "A2's run has not finished"
+  start="$(a3_start)" || die "R6 could not be read from $MEASURE/readings.json"
+  if [[ "$start" == a2 ]]; then source="$A2/final"; else source="$DRAFTER"; fi
+  log "A3-0 starts from $start's weights (D4: R6 in the float32 table), slot input '$variant'"
+  if [[ -n "$EXTRA_TRAIN" ]]; then read -r -a more <<< "$EXTRA_TRAIN"; sets+=("${more[@]}"); fi
+  step "$A3" hard "$PY" -m chat_vpa.e1_train --arm a3-0 --model "$IT_MODEL" --assistant "$source" \
+    --rollouts "$ROLLOUTS" --held-out "$HELD" --run "$A3" --set "${sets[@]}"
+  [[ -f "$A3/final/realiser.pt" ]] || die "A3-0's training ended without its final checkpoint"
+}
+
+count_a3() {
+  [[ -f "$A3/final/realiser.pt" ]] || die "A3-0 is not trained: A3_PARTS=train first"
+  local device=()
+  if [[ "$REQUIRE_GPU" != 1 ]]; then device=(--device cpu); fi
+  # shellcheck disable=SC2086
+  step "$OUT/count/a3-0" hard "$PY" -m chat_vpa.e1_count --model "$IT_MODEL" --table "$MEASURE/l4-fp32" \
+    --prompts "$PROMPTS" --drafter "a1=$DRAFTER" --drafter "a2=$A2/final" --drafter "a3-0=$A3/final" \
+    --out "$OUT/count/a3-0" "${device[@]}" $EXTRA_COUNT
+}
+
+a3_runs() {
+  local variant="${1:-}"
+  [[ "$variant" == add || "$variant" == replace ]] \
+    || die "name A3-0's slot input (docs/e1.md, Section 11.12): e1_step1.sh a3 add, or e1_step1.sh a3 replace"
+  check_python
+  check_gpu_free
+  [[ -f "$IT_MODEL/config.json" && -f "$DRAFTER/config.json" && -f "$PROMPTS" ]] \
+    || die "the assets are missing under $ASSETS: bash scripts/ncp/e1_setup.sh"
+  local part
+  for part in $A3_PARTS; do
+    case "$part" in
+      breakeven) breakeven ;;
+      train)     train_a3 "$variant" ;;
+      count)     count_a3 ;;
+      *)         die "unknown part: $part (breakeven, train, count)" ;;
+    esac
+  done
+  log "A3-0 finished: bash scripts/ncp/e1_step1.sh show-a3"
+}
+
+show_a3() {
+  "$PY" - "$OUT" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+print("== E1 Step 1, A3-0 (docs/e1.md, Sections 11.5, 11.12)")
+if (out / "breakeven" / "breakeven.md").exists():
+    print((out / "breakeven" / "breakeven.md").read_text())
+else:
+    print("breakeven: not computed (bash scripts/ncp/e1_step1.sh breakeven)")
+run = out / "a3-0"
+if (run / "metrics.jsonl").exists():
+    rows = [json.loads(line) for line in open(run / "metrics.jsonl", encoding="utf-8")]
+    train = [r for r in rows if "train/loss" in r]
+    evals = [r for r in rows if "eval/seconds" in r]
+    meta = json.loads((run / "config.json").read_text())
+    config = meta["config"]
+    print(f"a3-0: slot input '{config.get('slot_input', 'replace')}', from {meta['assistant']}")
+    if train:
+        t = train[-1]
+        print(f"  step {t['step']} of {config['steps']}, loss {t['train/loss']:.3f}, {t['train/steps_per_s']:.3f} "
+              f"steps/s, {t.get('train/eta_h', 0):.1f} h left (predicted), peak {t.get('train/peak_memory_gib', 0):.1f} "
+              f"GiB, micro-batch {t.get('train/micro_batch', 0):.0f}"
+              + (", done" if (run / "final" / "realiser.pt").exists() else ""))
+    for e in evals:
+        cycles = "  ".join(f"G={k.rsplit('_', 1)[1]}: {v:.2f}" for k, v in e.items()
+                           if k.startswith("eval/tokens_per_cycle_"))
+        hits = " ".join(f"{e[f'eval/hit_{k}']:.3f}" for k in range(1, 9) if f"eval/hit_{k}" in e)
+        print(f"  held-out at step {e['step']}: tokens per cycle along the continuations {cycles}; hit by slot {hits}")
+else:
+    print("a3-0: not started")
+if (out / "count" / "a3-0" / "count.md").exists():
+    print()
+    print((out / "count" / "a3-0" / "count.md").read_text())
+PYEOF
+}
+
 case "$ACTION" in
   launch)  start_tmux "$SESSION" "$OUT/timing.log" "bash scripts/ncp/e1_step1.sh run" ;;
   run)     timing_runs; show ;;
@@ -383,5 +511,11 @@ case "$ACTION" in
   a2)      start_tmux "$SESSION" "$OUT/a2.log" "bash scripts/ncp/e1_step1.sh run-a2" ;;
   run-a2)  a2_runs; show_a2 ;;
   show-a2) show_a2 ;;
-  *)       die "usage: e1_step1.sh [launch|run|show|a2|run-a2|show-a2]" ;;
+  breakeven) (export REQUIRE_GPU=0; check_python) > /dev/null; breakeven > /dev/null; cat "$OUT/breakeven/breakeven.md" ;;
+  a3)      [[ "${2:-}" == add || "${2:-}" == replace ]] \
+             || die "name A3-0's slot input (docs/e1.md, Section 11.12): e1_step1.sh a3 add, or e1_step1.sh a3 replace"
+           start_tmux "$SESSION" "$OUT/a3.log" "bash scripts/ncp/e1_step1.sh run-a3 $2" ;;
+  run-a3)  a3_runs "${2:-}"; show_a3 ;;
+  show-a3) show_a3 ;;
+  *)       die "usage: e1_step1.sh [launch|run|show|a2|run-a2|show-a2|breakeven|a3 add|a3 replace|run-a3 VARIANT|show-a3]" ;;
 esac

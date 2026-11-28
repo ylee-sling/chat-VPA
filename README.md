@@ -29,7 +29,10 @@ autoregressive teacher.
 > PyTorch on one NVIDIA L4 in bfloat16, where its output is not token-identical to the model's own, and 1.42x in
 > float32, where it is identical on all 50 prompts; 1.57x on the server's CPU (4 threads, float32, identical); and
 > 1.05x in LiteRT-LM, Google's on-device runtime, on its CPU and GPU backends. Step 1 is registered and confirmed
-> (27 November 2026; `docs/e1.md`, Section 11); its timing runs have run, and A2's training is next.
+> (27 November 2026; `docs/e1.md`, Section 11). Its first trained arm, A2 (Google's drafter distilled on the
+> model's own greedy rollouts), is measured (28 November 2026; Section 11.11): exact in float32 wherever Google's is,
+> it decodes 1.536x faster than the model alone in PyTorch on the L4 in float32 (Google's: 1.451x) and pays over
+> Google's drafter clearly in every table, by 5.8% there and 8.9% in vLLM.
 
 What exists today:
 
@@ -57,10 +60,13 @@ The numbers that motivated the design are measurements of the predecessor (text-
 
 **E1, Step 1** ([`docs/e1.md`](docs/e1.md), Section 11, confirmed by the author on 27 November 2026). First a
 check of LiteRT-LM's GPU backend, whose speculative decoding did not keep the model's text in Step 0
-(`bash scripts/ncp/e1_p2.sh`, run: undecided) and timing runs (`bash scripts/ncp/e1_step1.sh`, run); now, in one
-run (`bash scripts/ncp/e1_step1.sh a2`), the model's own greedy rollouts on English prompts and the first trained
-arm by Step 0's rules, A2: Google's drafter distilled on those rollouts, measured beside it; then A3, a drafter that
-decides one latent code per block and drafts the block in one call. B1, E0's Block-DFM as a drafter the model
+(`bash scripts/ncp/e1_p2.sh`, run: undecided) and timing runs (`bash scripts/ncp/e1_step1.sh`, run); then, in one
+run (`bash scripts/ncp/e1_step1.sh a2`, run), the model's own greedy rollouts on English prompts and the first
+trained arm by Step 0's rules, A2: Google's drafter distilled on those rollouts, measured beside it. Now A3, a
+drafter that decides one latent code per block and drafts the block in one call, starting with its control A3-0
+(`bash scripts/ncp/e1_step1.sh a3 add`, once the author has named its slot input, Section 11.12), and, beside it
+without the GPU, P3: what LiteRT-LM's model file holds and whether its own builder repacks it unchanged
+(`bash scripts/ncp/e1_p3.sh`). B1, E0's Block-DFM as a drafter the model
 verifies, which Step 0's bridge admitted (E0's checkpoints, unchanged, yield 2.6 tokens per backbone pass on
 MBPP code), waits for the author's sign-off after A2 and A3. Before any product claim the LiteRT-LM measurement
 runs on a physical laptop. Step 0 itself (`bash scripts/ncp/e1_setup.sh`, then `bash scripts/ncp/e1_step0.sh`) measured

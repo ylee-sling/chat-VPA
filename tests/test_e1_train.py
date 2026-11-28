@@ -153,10 +153,11 @@ def test_the_unrolled_pass_is_transformers_own_calls_of_the_drafter(tiny, implem
     assert int(scored[:, :, 0].sum()) == 11 + 5
 
 
-def test_a3_slots_are_single_calls_at_the_last_known_position(tiny):
+@pytest.mark.parametrize("slot_input", ["replace", "add"])
+def test_a3_slots_are_single_calls_at_the_last_known_position(tiny, slot_input):
     target, drafter = _models(tiny, torch.float64)
     generator = torch.Generator().manual_seed(8)
-    realiser = tr.OnePassRealiser(drafter, 3, torch.randn(64, generator=generator, dtype=torch.float64))
+    realiser = tr.OnePassRealiser(drafter, 3, torch.randn(64, generator=generator, dtype=torch.float64), slot_input)
     with torch.no_grad():
         realiser.depth.copy_(torch.randn(3, 64, generator=generator, dtype=torch.float64))
     examples = _sequences()
@@ -164,15 +165,18 @@ def test_a3_slots_are_single_calls_at_the_last_known_position(tiny):
     with torch.no_grad():
         last, targets, scored = realiser(tr.target_states(target, batch), batch)
     assert last.shape[2] == 3
+    embed = target.get_input_embeddings()
     for b, example in enumerate(examples):
         ids, start = example["ids"], example["start"]
         for i, q in enumerate(range(start, len(ids) - 1)):
             for j in range(3):
 
-                def inputs_of(k, previous, j=j):
+                def inputs_of(k, previous, j=j, ids=ids, q=q):
                     if k > 1:
                         return None
                     slot = (realiser.code + realiser.depth[j]).view(1, 1, -1)
+                    if slot_input == "add":                       # x_q's own embedding, the slot vector added
+                        slot = embed(torch.tensor([[ids[q]]])) + slot
                     return torch.cat([slot, previous], dim=-1)
 
                 inner, _, _ = _reference_calls(target, drafter, ids, q, inputs_of)
@@ -180,6 +184,25 @@ def test_a3_slots_are_single_calls_at_the_last_known_position(tiny):
                 assert bool(scored[b, i, j]) == (q + j + 1 <= len(ids) - 1)
                 if scored[b, i, j]:
                     assert int(targets[b, i, j]) == ids[q + j + 1]
+
+
+def test_added_slots_start_as_a2s_first_depth(tiny):
+    """With ``slot_input="add"`` and the code and depth vectors at zero, every slot is the drafter's first depth on
+    the accepted path (``a2_hidden``, itself checked against Transformers' calls above); with ``replace`` it is not."""
+    target, drafter = _models(tiny, torch.float64)
+    batch = tr.collate(_sequences(), pad_id=0)
+    with torch.no_grad():
+        states = tr.target_states(target, batch)
+        depth, targets, scored = tr.a2_hidden(drafter, states, batch, 3)
+        added, slot_targets, slot_scored = tr.OnePassRealiser(drafter, 3, torch.zeros(64, dtype=torch.float64),
+                                                              "add")(states, batch)
+        replaced, _, _ = tr.OnePassRealiser(drafter, 3, torch.zeros(64, dtype=torch.float64), "replace")(states, batch)
+    assert torch.equal(slot_targets, targets) and torch.equal(slot_scored, scored)
+    for j in range(3):
+        torch.testing.assert_close(added[:, :, j], depth[:, :, 0], rtol=1e-10, atol=1e-12)
+    assert (replaced[:, :, 0] - depth[:, :, 0]).abs().max() > 1e-3
+    with pytest.raises(ValueError, match="slot_input"):
+        tr.OnePassRealiser(drafter, 3, torch.zeros(64, dtype=torch.float64), "concatenate")
 
 
 def test_the_loss_is_the_mean_over_depths_of_each_depths_mean(tiny):
@@ -437,14 +460,39 @@ def test_a3_0_trains_its_code_and_saves_the_realiser(tiny, rollouts, tmp_path):
     start = tr.mask_code(target, tokenizer)
     moved = (saved["code"] - start).abs().max()
     assert 0 < moved < 1e-3                         # it starts at the mask token's embedding; two small steps since
+    assert saved["slot_input"] == "replace"                                # D4 as registered, the default
     rows = [json.loads(line) for line in open(tmp_path / "a3" / "metrics.jsonl", encoding="utf-8")]
     evals = [r for r in rows if "eval/hit_1" in r]
-    assert [r["step"] for r in evals] == [0, 2] and all("eval/tokens_per_cycle_3" in r for r in evals)
+    assert [r["step"] for r in evals] == [0, 2]
+    assert all("eval/tokens_per_cycle_2" in r and "eval/tokens_per_cycle_3" in r for r in evals)
     config = json.loads((tmp_path / "a3" / "config.json").read_text())
     # A2's per-position loss, cluster term included (the author's decision of 27 November 2026), in micro-batches
     # of at most 8.
     assert config["config"]["cluster_weight"] == 1.0 and config["config"]["micro_batch"] == 2
-    assert transformers.Gemma4AssistantForCausalLM.from_pretrained(tmp_path / "a3" / "final") is not None
+    final = transformers.Gemma4AssistantForCausalLM.from_pretrained(tmp_path / "a3" / "final")
+    realiser = tr.load_realiser(tmp_path / "a3" / "final", final)
+    assert realiser.slot_input == "replace" and torch.equal(realiser.code.detach(), saved["code"])
+    assert torch.equal(realiser.depth.detach(), saved["depth"])
+
+
+def test_a3_0_with_added_slots_starts_where_a2_starts(tiny, rollouts, tmp_path):
+    """``slot_input=add``: the code starts at zero, and before the first step slot 1's held-out choices are the
+    drafter's first depth's, as A2's run counts them from the same weights."""
+    assert _train(tiny, rollouts, tmp_path / "add", "a3-0", extra=("slots=3", "steps=2", "slot_input=add")) == 0
+    assert _train(tiny, rollouts, tmp_path / "a2", "a2", stop_at=1) == 0
+    saved = torch.load(tmp_path / "add" / "final" / "realiser.pt", weights_only=True)
+    assert saved["slot_input"] == "add" and 0 < float(saved["code"].abs().max()) < 1e-3
+
+    def first(run):
+        rows = [json.loads(line) for line in open(run / "metrics.jsonl", encoding="utf-8")]
+        return next(r for r in rows if "eval/hit_1" in r and r["step"] == 0)
+
+    a3, a2 = first(tmp_path / "add"), first(tmp_path / "a2")
+    assert a3["eval/hit_1"] == a2["eval/hit_1"] and a3["eval/hit_overall_1"] == a2["eval/hit_overall_1"]
+    assert math.isclose(a3["eval/token_nll_1"], a2["eval/token_nll_1"], rel_tol=1e-5)
+    assert tr.load_realiser(tmp_path / "add" / "final",
+                            transformers.Gemma4AssistantForCausalLM.from_pretrained(tmp_path / "add" / "final")
+                            ).slot_input == "add"
 
 
 # ---------------------------------------------------------------------------------------------

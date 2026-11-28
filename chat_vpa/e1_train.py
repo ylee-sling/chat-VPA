@@ -35,15 +35,19 @@ centroid logits (at inference only the top clusters are scored, so the right one
 depth's loss is the mean over its scored positions; the depths weigh equally. Every parameter of the drafter is
 trained; the assignment of tokens to clusters (``token_ordering``, a buffer) is not.
 
-**A3-0 (D4, D6, D8).** One call of the drafter over B = 8 slots per position q: slot j (1 to B) takes
-``code + depth[j]`` in place of the token embedding, concatenated with the target's last hidden state at q - 1, at
+**A3-0 (D4, D6, D8).** One call of the drafter over B = 8 slots per position q: slot j (1 to B) takes a slot
+vector in the token embedding's half of the input, concatenated with the target's last hidden state at q - 1, at
 position q, under the same visibility; the slots cannot attend to each other (the drafter's layers have no keys
-of their own). ``code`` is one learned vector (A3-0 has no latent; A3-oracle and A3 put a codebook's vector in its
-place), initialised to the target's input embedding of the tokenizer's mask token (zero if it has none), as
-text-VPA's mask vector was; ``depth`` holds one learned vector per slot, zero at the start. Slot j is scored on
-x_{q+j} by A2's per-position loss, the cluster term included (the author's decision of 27 November 2026, so that
-A3-0's one change from A2 is the one call over B slots; docs/e1.md, Section 11.9); the slots weigh equally. Its
-weights start from ``--assistant`` (D4: A2's, or A1's if A2 accepts fewer tokens).
+of their own). ``slot_input`` says what the slot vector is (docs/e1.md, Section 11.12): ``replace`` (D4 as
+registered) puts ``code + depth[j]`` in place of the token embedding, so no slot sees x_q, the last token of the
+cycle, which Google's drafter receives only through that embedding (the hidden state at q - 1 is the one that chose
+x_q); ``add`` adds ``code + depth[j]`` to x_q's embedding, so that with both at zero every slot is A2's depth 1.
+``code`` is one learned vector (A3-0 has no latent; A3-oracle and A3 put a codebook's vector in its place),
+initialised under ``replace`` to the target's input embedding of the tokenizer's mask token (zero if it has none),
+as text-VPA's mask vector was, and under ``add`` to zero; ``depth`` holds one learned vector per slot, zero at the
+start. Slot j is scored on x_{q+j} by A2's per-position loss, the cluster term included (the author's decision of
+27 November 2026, so that A3-0's one change from A2 is the one call over B slots; docs/e1.md, Section 11.9); the
+slots weigh equally. Its weights start from ``--assistant`` (D4: A2's, or A1's if A2 accepts fewer tokens).
 
 **The target (S5, S8)**: frozen, bfloat16, without gradients. One pass of its text model over a batch gives every
 position's last hidden state and the keys and values the drafter attends to (recomputed in every step, not
@@ -65,8 +69,10 @@ the other files of the drafter it started from, that ``generate`` and vLLM load 
 choice -- the best token among its top clusters, as it drafts at inference -- is the target's token, the same for
 the best token over the whole vocabulary, the losses, and the tokens per cycle those choices give along the
 rollouts' greedy continuations (``tokens_per_cycle``: a cycle at q accepts the leading drafts that equal the
-continuation and adds the next token; the first token comes from the prefill), at G in {2, 4, 6, 8} for A2 and
-G = B for A3-0. They are counts along the continuations with the training pass's keys, not decode measurements.
+continuation and adds the next token; the first token comes from the prefill), at G in {2, 4, 6, 8} for both arms
+and at G = B for A3-0 (A3-0 at G < B verifies the first G of its B slots). They are counts along the continuations with the training
+pass's keys, not decode measurements; ``chat_vpa.e1_count`` makes the same counts along the development prompts'
+continuations (``choice_hits``).
 """
 
 from __future__ import annotations
@@ -89,11 +95,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-__all__ = ["ARMS", "OnePassRealiser", "RolloutBatch", "TrainConfig", "a2_hidden", "attention_masks", "cluster_map",
-           "collate", "depth_loss", "drafter_choices", "drafter_hidden", "prepare", "query_positions",
-           "target_states", "tokens_per_cycle", "visibility", "vocab_cross_entropy"]
+__all__ = ["ARMS", "SLOT_INPUTS", "OnePassRealiser", "RolloutBatch", "TrainConfig", "a2_hidden", "attention_masks",
+           "choice_hits", "cluster_map", "collate", "depth_loss", "drafter_choices", "drafter_hidden", "load_realiser",
+           "prepare", "query_positions", "target_states", "tokens_per_cycle", "visibility", "vocab_cross_entropy"]
 
 ARMS = ("a2", "a3-0")
+SLOT_INPUTS = ("replace", "add")
 EVAL_LENGTHS = (2, 4, 6, 8)
 
 
@@ -257,14 +264,19 @@ def a2_hidden(drafter: Any, states: tuple[Tensor, dict[str, tuple[Tensor, Tensor
 
 class OnePassRealiser(nn.Module):
     """A3's realiser (D4): Google's drafter called once over ``slots`` query slots per position, slot j taking
-    ``code + depth[j]`` in place of the token embedding. A3-0's ``code`` is one learned vector."""
+    ``code + depth[j]`` in place of the token embedding (``slot_input="replace"``, D4 as registered) or added to the
+    embedding of x_q, the cycle's last token (``"add"``; the module docstring). A3-0's ``code`` is one learned
+    vector."""
 
-    def __init__(self, drafter: Any, slots: int, code: Tensor) -> None:
+    def __init__(self, drafter: Any, slots: int, code: Tensor, slot_input: str = "replace") -> None:
         super().__init__()
         if slots < 1:
             raise ValueError("need at least one slot")
+        if slot_input not in SLOT_INPUTS:
+            raise ValueError(f"slot_input must be one of {SLOT_INPUTS}")
         self.drafter = drafter
         self.slots = slots
+        self.slot_input = slot_input
         dtype = drafter.pre_projection.weight.dtype
         self.code = nn.Parameter(code.detach().to(dtype).clone())
         self.depth = nn.Parameter(torch.zeros(slots, code.shape[-1], dtype=dtype))
@@ -273,13 +285,16 @@ class OnePassRealiser(nn.Module):
                 ) -> tuple[Tensor, Tensor, Tensor]:
         """The last hidden state of every slot ``[B, Q, slots, d]``, the targets ``[B, Q, slots]`` and which are
         scored."""
-        hidden, kv, _ = _drafter_inputs(self.drafter, states)
+        hidden, kv, embeds = _drafter_inputs(self.drafter, states)
         positions, valid = query_positions(batch)
         rows, width = positions.shape
         previous = _gather(hidden, positions - 1)                     # [B, Q, D]
         slot = (self.code + self.depth).to(previous.dtype)            # [S, D]
-        inputs = torch.cat([slot.expand(rows, width, -1, -1),
-                            previous[:, :, None].expand(-1, -1, self.slots, -1)], dim=-1)
+        if self.slot_input == "add":
+            first = _gather(embeds, positions)[:, :, None] + slot     # x_q's embedding + slot j: [B, Q, S, D]
+        else:
+            first = slot.expand(rows, width, -1, -1)
+        inputs = torch.cat([first, previous[:, :, None].expand(-1, -1, self.slots, -1)], dim=-1)
         flat = positions.repeat_interleave(self.slots, dim=1)         # [B, Q * S], slot-minor
         masks = _masks_for(self.drafter, flat, hidden.shape[1])
         last = drafter_hidden(self.drafter, inputs.reshape(rows, width * self.slots, -1), flat, kv, masks)
@@ -410,6 +425,51 @@ def tokens_per_cycle(hits: Sequence[Sequence[Sequence[bool]]], length: int) -> t
     return cycles, positions
 
 
+@torch.no_grad()
+def choice_hits(target: Any, drafter: Any, module: nn.Module | None, count: int, examples: Sequence[dict[str, Any]],
+                batch_size: int, pad_id: int, device: torch.device, vocab_chunk: int, clusters: Tensor | None
+                ) -> tuple[list[list[list[bool]]], list[list[list[bool]]], dict[str, list[float]]]:
+    """Along each example's continuation, at each drafted position q (``query_positions``) and each depth (``module``
+    None: Google's drafter unrolled on the accepted path, ``a2_hidden``, over ``count`` depths) or slot (``module``
+    an ``OnePassRealiser``): whether the drafter's greedy choice -- the best token among its top clusters, as it
+    drafts at inference -- is the continuation's token (``hits[example][position][depth]``; ``tokens_per_cycle``
+    reads them), the same for the best token over the whole vocabulary, and the totals per depth: the positions
+    scored (``n``), both kinds of hits and the summed cross-entropy (``nll``). A depth without a target there is a
+    miss."""
+    hits_clustered: list[list[list[bool]]] = []
+    hits_overall: list[list[list[bool]]] = []
+    sums = {"n": [0.0] * count, "clustered": [0.0] * count, "overall": [0.0] * count, "nll": [0.0] * count}
+    for s in range(0, len(examples), batch_size):
+        batch = collate(examples[s:s + batch_size], pad_id).to(device)
+        states = target_states(target, batch)
+        if module is None:
+            last, targets, scored = a2_hidden(drafter, states, batch, count)
+        else:
+            last, targets, scored = module(states, batch)
+            if last.shape[2] != count:
+                raise ValueError(f"the realiser has {last.shape[2]} slots, not {count}")
+        rows, width = scored.shape[:2]
+        hit_c = torch.zeros(rows, width, count, dtype=torch.bool, device=device)
+        hit_o = torch.zeros_like(hit_c)
+        for k in range(count):
+            chosen = scored[:, :, k]
+            clustered, overall, nll = drafter_choices(drafter, last[:, :, k][chosen], targets[:, :, k][chosen],
+                                                      vocab_chunk, clusters)
+            truth = targets[:, :, k][chosen]
+            hit_c[:, :, k][chosen] = clustered == truth
+            hit_o[:, :, k][chosen] = overall == truth
+            sums["n"][k] += float(chosen.sum())
+            sums["clustered"][k] += float((clustered == truth).sum())
+            sums["overall"][k] += float((overall == truth).sum())
+            sums["nll"][k] += float(nll.sum())
+        positions = (batch.length - 1 - batch.start).tolist()
+        for b, n in enumerate(positions):
+            hits_clustered.append(hit_c[b, :n].tolist())
+            hits_overall.append(hit_o[b, :n].tolist())
+        del states, last, targets, scored
+    return hits_clustered, hits_overall, sums
+
+
 # ---------------------------------------------------------------------------------------------
 # The trainer
 # ---------------------------------------------------------------------------------------------
@@ -432,6 +492,7 @@ class TrainConfig:
     depths: int = 4                        # A2: G_train
     slots: int = 8                         # A3-0: B
     cluster_weight: float = 1.0            # S7's cluster term (A3-0 too: the author's decision of 27 November 2026)
+    slot_input: str = "replace"            # A3-0: "replace" (D4 as registered) or "add" (x_q's embedding kept)
     micro_batch: int = 0                   # 0: the arm's own (A2: the whole batch, as timed; A3-0: 8)
     eval_depths: int = 8
     eval_every: int = 2_500
@@ -445,6 +506,8 @@ class TrainConfig:
             raise ValueError(f"arm must be one of {ARMS}")
         if self.cluster_weight < 0:
             raise ValueError("cluster_weight must not be negative")
+        if self.slot_input not in SLOT_INPUTS:
+            raise ValueError(f"slot_input must be one of {SLOT_INPUTS}")
         if self.micro_batch <= 0:
             self.micro_batch = self.batch if self.arm == "a2" else min(self.batch, 8)
         self.micro_batch = min(self.micro_batch, self.batch)
@@ -602,41 +665,16 @@ class DrafterTrainer:
         self.module.eval()
         start = time.perf_counter()
         count = cfg.eval_depths if cfg.arm == "a2" else cfg.slots
-        hits_clustered: list[list[list[bool]]] = []
-        hits_overall: list[list[list[bool]]] = []
-        sums = {"n": [0.0] * count, "clustered": [0.0] * count, "overall": [0.0] * count, "nll": [0.0] * count}
-        for s in range(0, len(self.held_out), self.micro_batch):
-            batch = collate(self.held_out[s:s + self.micro_batch], self.pad_id).to(self.device)
-            states = target_states(self.target, batch)
-            if cfg.arm == "a2":
-                last, targets, scored = a2_hidden(self.drafter, states, batch, count)
-            else:
-                last, targets, scored = self.module(states, batch)
-            rows, width = scored.shape[:2]
-            hit_c = torch.zeros(rows, width, count, dtype=torch.bool, device=self.device)
-            hit_o = torch.zeros_like(hit_c)
-            for k in range(count):
-                chosen = scored[:, :, k]
-                clustered, overall, nll = drafter_choices(self.drafter, last[:, :, k][chosen],
-                                                          targets[:, :, k][chosen], cfg.vocab_chunk, self.clusters)
-                truth = targets[:, :, k][chosen]
-                hit_c[:, :, k][chosen] = clustered == truth
-                hit_o[:, :, k][chosen] = overall == truth
-                sums["n"][k] += float(chosen.sum())
-                sums["clustered"][k] += float((clustered == truth).sum())
-                sums["overall"][k] += float((overall == truth).sum())
-                sums["nll"][k] += float(nll.sum())
-            positions = (batch.length - 1 - batch.start).tolist()
-            for b, n in enumerate(positions):
-                hits_clustered.append(hit_c[b, :n].tolist())
-                hits_overall.append(hit_o[b, :n].tolist())
+        hits_clustered, hits_overall, sums = choice_hits(
+            self.target, self.drafter, None if cfg.arm == "a2" else self.module, count, self.held_out,
+            self.micro_batch, self.pad_id, self.device, cfg.vocab_chunk, self.clusters)
         metrics: dict[str, float] = {"rollouts": float(len(self.held_out))}
         for k in range(count):
             if sums["n"][k]:
                 metrics[f"hit_{k + 1}"] = sums["clustered"][k] / sums["n"][k]
                 metrics[f"hit_overall_{k + 1}"] = sums["overall"][k] / sums["n"][k]
                 metrics[f"token_nll_{k + 1}"] = sums["nll"][k] / sums["n"][k]
-        lengths = [g for g in EVAL_LENGTHS if g <= count] if cfg.arm == "a2" else [cfg.slots]
+        lengths = sorted({g for g in EVAL_LENGTHS if g <= count} | (set() if cfg.arm == "a2" else {count}))
         for g in lengths:
             for name, hits in (("", hits_clustered), ("overall_", hits_overall)):
                 cycles = tokens = 0
@@ -700,14 +738,25 @@ def save_final(trainer: DrafterTrainer, source: Path, out: Path) -> Path:
                                                                ".complete", ".cache", "realiser.pt", "training.json"))
     trainer.drafter.save_pretrained(tmp)
     if isinstance(trainer.module, OnePassRealiser):
-        torch.save({"slots": trainer.module.slots, "code": trainer.module.code.detach().cpu(),
-                    "depth": trainer.module.depth.detach().cpu()}, tmp / "realiser.pt")
+        torch.save({"slots": trainer.module.slots, "slot_input": trainer.module.slot_input,
+                    "code": trainer.module.code.detach().cpu(), "depth": trainer.module.depth.detach().cpu()},
+                   tmp / "realiser.pt")
     with open(tmp / "training.json", "w", encoding="utf-8") as handle:
         json.dump({"arm": trainer.cfg.arm, "step": trainer.step, "config": trainer.cfg.to_dict(),
                    "started_from": str(source)}, handle, indent=2)
     shutil.rmtree(out, ignore_errors=True)
     tmp.rename(out)
     return out
+
+
+def load_realiser(directory: Path, drafter: Any) -> OnePassRealiser:
+    """A3's realiser of a final directory (``save_final``) around its drafter, loaded already (a run saved before
+    ``slot_input`` existed is ``replace``)."""
+    saved = torch.load(Path(directory) / "realiser.pt", map_location="cpu", weights_only=True)
+    realiser = OnePassRealiser(drafter, int(saved["slots"]), saved["code"], str(saved.get("slot_input", "replace")))
+    with torch.no_grad():
+        realiser.depth.copy_(saved["depth"].to(realiser.depth.dtype))
+    return realiser.to(drafter.pre_projection.weight.device)
 
 
 def timing(trainer: DrafterTrainer, skip: int = 10) -> dict[str, Any]:
@@ -787,7 +836,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.arm == "a2":
         module: nn.Module = drafter
     else:
-        module = OnePassRealiser(drafter, cfg.slots, mask_code(target, tokenizer)).to(device)
+        code = mask_code(target, tokenizer)
+        if cfg.slot_input == "add":
+            code = torch.zeros_like(code)                         # every slot starts as A2's depth 1
+        module = OnePassRealiser(drafter, cfg.slots, code, cfg.slot_input).to(device)
     stream = EpochStream(records, cfg.seed, payload["stream"] if payload else None)
     logger = MetricLogger(run, enabled=True)
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
