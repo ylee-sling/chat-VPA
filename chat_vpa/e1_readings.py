@@ -59,8 +59,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-__all__ = ["best_length", "break_even", "line_fit", "pass_seconds", "read_pytorch", "read_vllm", "render",
-           "render_break_even", "verdict"]
+__all__ = ["best_length", "break_even", "line_fit", "pass_seconds", "read_one_pass", "read_pytorch", "read_vllm",
+           "render", "render_break_even", "render_one_pass", "verdict"]
 
 DRIFT = (0.98, 1.02)
 _DRAFT = re.compile(r"^([a-z][a-z0-9]*)-([1-9]\d*)(-clean)?$")
@@ -230,6 +230,76 @@ def read_vllm(table: Path, first: str = "a1", second: str = "a2") -> dict[str, A
                                         f"{second} costs against {first} clearly")}
     out["tokens_per_cycle"] = {name: arms[name]["tokens_per_cycle"] for name in drafts.values()}
     return out
+
+
+def read_one_pass(table: Path, drafter: str, references: Sequence[str] = ("a1", "a2"),
+                  bars: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A one-pass drafter's table (docs/e1.md, Sections 6.1 and 11.13): R1 for every arm; the drafter's best G and
+    its speed-up over ``ar`` (R2's rule); its decode rate at its best G over each reference's at the reference's
+    best G, through Transformers' own call and, where the table has it, with the accepted prefix's keys (R7's
+    rule: clearly above or below 1); its tokens per cycle at every G beside the bars of ``breakeven`` (described:
+    the speed-ups are what is read)."""
+    summary, by_arm, ids = _load_pytorch(table)
+    arms = summary["arms"]
+    drafts = _arms(list(arms))
+    if not any(k[0] == drafter for k in drafts):
+        raise ValueError(f"{table} has no arm of {drafter}")
+    columns = {name: _columns(by_arm[name], ids) for name in drafts.values()}
+    out: dict[str, Any] = {"table": str(table), "environment": summary["environment"], "prompts": len(ids),
+                           "max_new_tokens": summary["max_new_tokens"], "drafter": drafter, "r1": {}, "r2": {},
+                           "against": []}
+    for _, name in sorted(drafts.items()):
+        out["r1"][name] = {"exact": arms[name]["exact"], "of": len(ids),
+                           "reading": "exact" if arms[name]["exact"] == len(ids) else "not token-identical"}
+    best = {label: best_length(arms, label) for label in sorted({k[0] for k in drafts})}
+    for label, g in best.items():
+        if g is None:
+            continue
+        s = arms[drafts[(label, g, False)]]
+        low, high = s["decode_speedup_interval"]
+        out["r2"][label] = {"best_g": g, "speedup": s["decode_speedup"], "low": low, "high": high,
+                            "reading": verdict(low, high, 1.0, "pays clearly", "costs clearly")}
+    mine = drafts[(drafter, best[drafter], False)]
+    for reference in references:
+        if best.get(reference) is None:
+            continue
+        for clean in (False, True):
+            theirs = drafts.get((reference, best[reference], clean))
+            if theirs is None:
+                continue
+            ci = _interval([columns[mine]["decode_tokens"], columns[mine]["decode_seconds"],
+                            columns[theirs]["decode_tokens"], columns[theirs]["decode_seconds"]], _ratio_of_ratios)
+            out["against"].append({"reference": theirs, "keys": "accepted prefix" if clean else "Transformers'",
+                                   "ratio": ci, "reading": verdict(ci["low"], ci["high"], 1.0,
+                                                                   f"{drafter} pays over {reference} clearly",
+                                                                   f"{drafter} costs against {reference} clearly")})
+    out["tokens_per_cycle"] = {name: arms[name]["tokens_per_cycle"] for name in drafts.values()}
+    if bars is not None:
+        out["bars"] = [{"against": b["against"], "g": b["g"], "registered": b["registered"],
+                        "by_block": {x["b"]: x["tau_star"] for x in b["by_block"]}} for b in bars["bars"]]
+    return out
+
+
+def render_one_pass(r: dict[str, Any]) -> str:
+    lines = [f"# E1 Step 1: the one-pass drafter {r['drafter']} in {r['table']} (docs/e1.md, Sections 6.1, 11.13)",
+             "", f"Where: {_where(r['environment'])}; {r['prompts']} prompts x {r['max_new_tokens']} tokens. Every "
+             "number is *measured* by this table's run, but for the bars, which are *predicted* (breakeven); "
+             "intervals are 95% paired bootstraps over prompts.", ""]
+    for name, x in r["r1"].items():
+        lines.append(f"- R1, {name}: {x['exact']} of {x['of']} prompts token-identical to ar: {x['reading']}")
+    for label, x in r["r2"].items():
+        lines.append(f"- R2's rule, {label} at its best G = {x['best_g']}: decode speed-up {x['speedup']:.3f} "
+                     f"[{x['low']:.3f}, {x['high']:.3f}]: {x['reading']}")
+    for x in r["against"]:
+        lines.append(f"- R7's rule, {r['drafter']} at G = {r['r2'][r['drafter']]['best_g']} against {x['reference']} "
+                     f"({x['keys']} keys): decode rate ratio {_ci(x['ratio'])}: {x['reading']}")
+    cycles = ", ".join(f"{k} {v:.2f}" for k, v in r["tokens_per_cycle"].items() if v is not None)
+    lines.append(f"- tokens per cycle: {cycles}")
+    for b in r.get("bars", []):
+        lines.append(f"- the bar against {b['against']} at G = {b['g']}"
+                     + (" (the registered gate)" if b["registered"] else "") + ": tau* "
+                     + ", ".join(f"{v:.3f} at B = {k}" for k, v in sorted(b["by_block"].items())) + " (predicted)")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -421,6 +491,12 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--blocks", type=int, nargs="+", default=[2, 4, 6, 8])
     e.add_argument("--calls", type=float, default=1.25, help="A3's drafting in calls of the reference's drafter")
     e.add_argument("--out", type=Path, required=True)
+    o = sub.add_parser("one-pass", help="a one-pass drafter's table: R1, its speed-up, against A1 and A2")
+    o.add_argument("--table", type=Path, required=True)
+    o.add_argument("--drafter", required=True, help="the one-pass drafter's label (a30, a3)")
+    o.add_argument("--against", nargs="+", default=["a1", "a2"])
+    o.add_argument("--breakeven", type=Path, default=None, help="breakeven.json: the bars beside the counts")
+    o.add_argument("--out", type=Path, required=True)
     r = sub.add_parser("read", help="read the tables and write readings.json and readings.md")
     r.add_argument("--tables", type=Path, nargs="*", default=[])
     r.add_argument("--vllm", type=Path, default=None)
@@ -432,6 +508,20 @@ def main(argv: list[str] | None = None) -> int:
         if g is None:
             raise SystemExit(f"{args.table} has no arm of {args.drafter}")
         print(g)
+        return 0
+    if args.command == "one-pass":
+        bars = json.loads(args.breakeven.read_text(encoding="utf-8")) if args.breakeven else None
+        try:
+            result = read_one_pass(args.table, args.drafter, args.against, bars)
+        except ValueError as error:
+            raise SystemExit(str(error)) from None
+        from chat_vpa.e1_common import write_json
+
+        args.out.mkdir(parents=True, exist_ok=True)
+        write_json(args.out / f"one-pass-{args.drafter}.json", result)
+        text = render_one_pass(result)
+        (args.out / f"one-pass-{args.drafter}.md").write_text(text + "\n", encoding="utf-8")
+        print(text)
         return 0
     if args.command == "breakeven":
         try:

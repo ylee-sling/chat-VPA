@@ -95,11 +95,14 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-__all__ = ["ARMS", "SLOT_INPUTS", "OnePassRealiser", "RolloutBatch", "TrainConfig", "a2_hidden", "attention_masks",
-           "choice_hits", "cluster_map", "collate", "depth_loss", "drafter_choices", "drafter_hidden", "load_realiser",
-           "prepare", "query_positions", "target_states", "tokens_per_cycle", "visibility", "vocab_cross_entropy"]
+__all__ = ["ARMS", "SLOT_INPUTS", "BlockEncoder", "CodePredictor", "CodedRealiser", "OnePassRealiser", "RolloutBatch",
+           "TrainConfig", "VectorQuantiser", "a2_hidden", "attention_masks", "choice_hits", "cluster_map", "collate",
+           "depth_loss", "drafter_choices", "drafter_hidden", "load_realiser", "one_layer_drafter", "prepare",
+           "query_positions", "target_states", "tokens_per_cycle", "visibility", "vocab_cross_entropy"]
 
-ARMS = ("a2", "a3-0")
+ARMS = ("a2", "a3-0", "a3-oracle", "a3")
+CODED = ("a3-oracle", "a3")
+CODE_COUNT_LENGTH = 4_096                  # longer than any codebook here: the histogram of chosen codes
 SLOT_INPUTS = ("replace", "add")
 EVAL_LENGTHS = (2, 4, 6, 8)
 
@@ -285,21 +288,294 @@ class OnePassRealiser(nn.Module):
                 ) -> tuple[Tensor, Tensor, Tensor]:
         """The last hidden state of every slot ``[B, Q, slots, d]``, the targets ``[B, Q, slots]`` and which are
         scored."""
+        last, targets, scored, _ = self._draft(states, batch, lambda *_: (self.code, {}))
+        return last, targets, scored
+
+    def decode_code(self, token: Tensor, previous: Tensor, kv: dict[str, tuple[Tensor, Tensor]], position: int
+                    ) -> Tensor:
+        """The code of one decoding cycle ``[D]`` (``e1_decode``'s one-pass drafting): A3-0's one vector."""
+        return self.code
+
+    def _draft(self, states: tuple[Tensor, dict[str, tuple[Tensor, Tensor]], Tensor], batch: RolloutBatch,
+               code_at: Any) -> tuple[Tensor, Tensor, Tensor, dict[str, Any]]:
+        """The slots' pass with the code ``code_at(hidden, positions, valid)`` gives: one vector ``[D]`` for every
+        position (A3-0) or one per position ``[B, Q, D]`` (A3-oracle, A3), with what else it computed."""
         hidden, kv, embeds = _drafter_inputs(self.drafter, states)
         positions, valid = query_positions(batch)
         rows, width = positions.shape
         previous = _gather(hidden, positions - 1)                     # [B, Q, D]
-        slot = (self.code + self.depth).to(previous.dtype)            # [S, D]
-        if self.slot_input == "add":
-            first = _gather(embeds, positions)[:, :, None] + slot     # x_q's embedding + slot j: [B, Q, S, D]
+        code, aux = code_at(hidden, positions, valid)
+        code = code.to(previous.dtype)
+        if code.dim() == 1:
+            slot = (code + self.depth).expand(rows, width, -1, -1)    # [B, Q, S, D]
         else:
-            first = slot.expand(rows, width, -1, -1)
+            slot = code[:, :, None, :] + self.depth
+        if self.slot_input == "add":
+            first = _gather(embeds, positions)[:, :, None] + slot     # x_q's embedding + slot j
+        else:
+            first = slot
         inputs = torch.cat([first, previous[:, :, None].expand(-1, -1, self.slots, -1)], dim=-1)
         flat = positions.repeat_interleave(self.slots, dim=1)         # [B, Q * S], slot-minor
         masks = _masks_for(self.drafter, flat, hidden.shape[1])
         last = drafter_hidden(self.drafter, inputs.reshape(rows, width * self.slots, -1), flat, kv, masks)
         targets, scored = _targets(batch, positions, valid, self.slots)
-        return last.view(rows, width, self.slots, -1), targets, scored
+        return last.view(rows, width, self.slots, -1), targets, scored, aux
+
+
+# ---------------------------------------------------------------------------------------------
+# A3-oracle and A3: a code per position (D1 to D3, D5, D8; docs/e1.md, Section 11.13)
+# ---------------------------------------------------------------------------------------------
+
+class BlockEncoder(nn.Module):
+    """A3's encoder (D1), used only in training: at each drafted position q, the target's last hidden states at the
+    block's own positions q + 1 .. q + B (the tokens the slots draft), each normalised without parameters and
+    mapped to ``width`` through a GELU, concatenated in order and mapped to the code's space (the token
+    embedding's width). A position past the sequence's end contributes zeros."""
+
+    def __init__(self, hidden: int, slots: int, code_dim: int, width: int = 64) -> None:
+        super().__init__()
+        self.hidden, self.slots, self.code_dim, self.width = hidden, slots, code_dim, width
+        self.inner = nn.Linear(hidden, width)
+        self.outer = nn.Linear(slots * width, code_dim)
+
+    def forward(self, hidden: Tensor, positions: Tensor, length: Tensor) -> Tensor:
+        rows, width = positions.shape
+        index = positions[..., None] + torch.arange(1, self.slots + 1, device=positions.device)   # [B, Q, S]
+        exists = index <= (length - 1)[:, None, None]
+        states = _gather(hidden, index.flatten(1)).view(rows, width, self.slots, -1).to(self.inner.weight.dtype)
+        states = F.layer_norm(states, (states.shape[-1],))
+        inner = F.gelu(self.inner(states)) * exists[..., None]
+        return self.outer(inner.flatten(-2))                                                      # [B, Q, D]
+
+
+class VectorQuantiser(nn.Module):
+    """D2 and D3: ``codes`` vectors of ``dim``; each encoding goes to its nearest code (Euclidean). The codes are
+    exponential moving averages (``decay``) of the encodings assigned to them. They are updated once per training
+    step from all of that step's assignments (``apply``), so that a batch run again in halves after running out of
+    memory is not counted twice (``discard``); a code that has gone unused (its moving count below
+    ``restart_below``) restarts at a random encoding of the step. The first training batch starts every code at
+    one of its encodings. The encoder learns through the straight-through estimator and the commitment loss
+    ``beta`` x the squared distance to its code (a mean over the code's dimensions, summed over positions; the
+    trainer divides it by the batch's positions, as it does the slots' losses)."""
+
+    def __init__(self, codes: int, dim: int, decay: float = 0.99, beta: float = 0.25, restart_below: float = 0.1,
+                 eps: float = 1e-5) -> None:
+        super().__init__()
+        if codes < 2:
+            raise ValueError("a codebook needs at least two codes")
+        self.codes, self.dim, self.decay, self.beta = codes, dim, decay, beta
+        self.restart_below, self.eps = restart_below, eps
+        self.register_buffer("embed", torch.zeros(codes, dim))
+        self.register_buffer("cluster_size", torch.zeros(codes))
+        self.register_buffer("embed_sum", torch.zeros(codes, dim))
+        self.register_buffer("initialised", torch.zeros((), dtype=torch.bool))
+        self._pending: list[tuple[Tensor, Tensor]] = []
+
+    def nearest(self, encoding: Tensor) -> Tensor:
+        flat = encoding.reshape(-1, self.dim).to(self.embed.dtype)
+        distances = (flat.pow(2).sum(-1, keepdim=True) - 2 * flat @ self.embed.t()
+                     + self.embed.pow(2).sum(-1)[None])
+        return distances.argmin(-1).view(encoding.shape[:-1])
+
+    def forward(self, encoding: Tensor, valid: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """The code of every position with the straight-through gradient ``[B, Q, D]``, its index ``[B, Q]`` and the
+        commitment loss summed over the valid positions."""
+        if self.training and not bool(self.initialised):
+            self._initialise(encoding.detach()[valid])
+        index = self.nearest(encoding.detach())
+        quantised = self.embed[index].to(encoding.dtype)
+        if self.training:
+            self._pending.append((index[valid], encoding.detach()[valid].to(self.embed.dtype)))
+        commitment = self.beta * ((encoding - quantised.detach()).pow(2).mean(-1) * valid).sum()
+        return encoding + (quantised - encoding).detach(), index, commitment
+
+    @torch.no_grad()
+    def _initialise(self, rows: Tensor) -> None:
+        if rows.shape[0] == 0:
+            raise ValueError("the first batch has no position to start the codebook from")
+        rows = rows.to(self.embed.dtype)
+        if rows.shape[0] >= self.codes:
+            pick = torch.randperm(rows.shape[0], device=rows.device)[: self.codes]
+            start = rows[pick]
+        else:                                           # fewer encodings than codes: repeat them, apart by a little
+            pick = torch.randint(0, rows.shape[0], (self.codes,), device=rows.device)
+            start = rows[pick]
+            start = start + 1e-3 * start.pow(2).mean().sqrt() * torch.randn_like(start)
+        self.embed.copy_(start)
+        self.embed_sum.copy_(start)
+        self.cluster_size.fill_(1.0)
+        self.initialised.fill_(True)
+
+    @torch.no_grad()
+    def apply(self) -> dict[str, float]:
+        """The step's update of the codebook; what it did."""
+        if not self._pending:
+            return {}
+        index = torch.cat([i for i, _ in self._pending])
+        rows = torch.cat([r for _, r in self._pending])
+        self._pending = []
+        counts = torch.bincount(index, minlength=self.codes).float()
+        sums = torch.zeros_like(self.embed).index_add_(0, index, rows)
+        self.cluster_size.mul_(self.decay).add_(counts, alpha=1 - self.decay)
+        self.embed_sum.mul_(self.decay).add_(sums, alpha=1 - self.decay)
+        total = self.cluster_size.sum()
+        size = (self.cluster_size + self.eps) / (total + self.codes * self.eps) * total
+        self.embed.copy_(self.embed_sum / size[:, None])
+        dead = self.cluster_size < self.restart_below
+        restarted = int(dead.sum())
+        if restarted and rows.shape[0]:
+            fresh = rows[torch.randint(0, rows.shape[0], (restarted,), device=rows.device)]
+            self.embed[dead] = fresh
+            self.embed_sum[dead] = fresh
+            self.cluster_size[dead] = 1.0
+        share = counts / counts.sum().clamp(min=1.0)
+        perplexity = torch.exp(-(share * torch.log(share.clamp(min=1e-12))).sum())
+        return {"code_perplexity": float(perplexity), "codes_used": float((counts > 0).sum()),
+                "codes_restarted": float(restarted)}
+
+    def discard(self) -> None:
+        self._pending = []
+
+
+def one_layer_drafter(drafter: Any) -> Any:
+    """D5's body: a drafter of one layer, with its own copies of the realiser's input projection, its last
+    full-attention layer (which sees the whole prefix) and its final norm. Its token embedding, output layer and
+    post-projection are not used by the predictor: the first two are the realiser drafter's own modules (no memory
+    of their own), the third a frozen copy."""
+    from transformers import Gemma4AssistantForCausalLM
+
+    whole = drafter.config.to_dict()
+    text = dict(whole["text_config"])
+    kinds = list(text["layer_types"])
+    if "full_attention" not in kinds:
+        raise ValueError("the predictor copies a full-attention layer, and the drafter has none")
+    source = max(i for i, kind in enumerate(kinds) if kind == "full_attention")
+    overrides = (text.get("per_layer_config") or {}).get(str(source), {})
+    text.update(num_hidden_layers=1, layer_types=["full_attention"], per_layer_config={"0": dict(overrides)})
+    if text.get("num_kv_shared_layers"):
+        text["num_kv_shared_layers"] = 1
+    whole["text_config"] = text
+    config = type(drafter.config).from_dict(whole)
+    weight = drafter.pre_projection.weight
+    one = Gemma4AssistantForCausalLM(config)
+    one.model.embed_tokens = drafter.model.embed_tokens
+    one.lm_head = drafter.lm_head
+    if hasattr(drafter, "masked_embedding"):
+        one.masked_embedding = drafter.masked_embedding
+    one = one.to(device=weight.device, dtype=weight.dtype)
+    one.pre_projection.load_state_dict(drafter.pre_projection.state_dict())
+    one.post_projection.load_state_dict(drafter.post_projection.state_dict())
+    one.post_projection.requires_grad_(False)
+    one.model.layers[0].load_state_dict(drafter.model.layers[source].state_dict())
+    one.model.norm.load_state_dict(drafter.model.norm.state_dict())
+    return one
+
+
+class CodePredictor(nn.Module):
+    """D5: one drafter-style layer (``one_layer_drafter``) on the realiser's own inputs without a code -- x_q's
+    embedding and the target's last hidden state at q - 1, at position q, under the same visibility -- and a linear
+    map to the ``codes`` logits, started at zero (every code equally likely)."""
+
+    UNUSED = ("body.model.embed_tokens.", "body.lm_head.", "body.masked_embedding.", "body.post_projection.")
+
+    def __init__(self, body: Any, codes: int) -> None:
+        super().__init__()
+        self.body = body
+        width = body.pre_projection.weight.shape[0]
+        self.head = nn.Linear(width, codes).to(device=body.pre_projection.weight.device,
+                                               dtype=body.pre_projection.weight.dtype)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def trainable(self) -> list[nn.Parameter]:
+        """What A3 trains: the body's own projection, layer and norm, and the head."""
+        return [p for name, p in self.named_parameters() if not name.startswith(self.UNUSED)]
+
+    def trained_state(self) -> dict[str, Tensor]:
+        """The state that ``realiser.pt`` keeps (without the modules the body shares with the realiser's drafter)."""
+        return {k: v.detach().cpu() for k, v in self.state_dict().items() if not k.startswith(self.UNUSED)}
+
+    def load_trained(self, state: dict[str, Tensor]) -> None:
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        if unexpected or any(not key.startswith(self.UNUSED) for key in missing):
+            raise ValueError(f"the predictor's saved state does not fit: missing {missing}, unexpected {unexpected}")
+
+    def forward(self, states: tuple[Tensor, dict[str, tuple[Tensor, Tensor]], Tensor], positions: Tensor) -> Tensor:
+        hidden, kv, embeds = _drafter_inputs(self.body, states)
+        inputs = torch.cat([_gather(embeds, positions), _gather(hidden, positions - 1)], dim=-1)
+        masks = _masks_for(self.body, positions, hidden.shape[1])
+        return self.head(drafter_hidden(self.body, inputs, positions, kv, masks))           # [B, Q, C]
+
+    def decode_logits(self, token: Tensor, previous: Tensor, full: tuple[Tensor, Tensor], position: int) -> Tensor:
+        """One decoding cycle's logits ``[C]``: x_q's embedding ``token`` and the target's last hidden state
+        ``previous`` (``[1, 1, D]`` each) at ``position`` q, attending to the target's full-attention keys and values
+        of the accepted prefix (positions 0 .. q - 1), all of which a full-attention query at q sees."""
+        dtype = self.body.pre_projection.weight.dtype
+        keys = full[0].shape[2]
+        if keys != position:
+            raise ValueError(f"the predictor attends to the {position} positions before q, not to {keys}")
+        positions = torch.tensor([[position]], device=token.device)
+        masks = _masks_for(self.body, positions, keys)
+        inputs = torch.cat([token, previous], dim=-1).to(dtype)
+        hidden = drafter_hidden(self.body, inputs, positions, {"full_attention": (full[0].to(dtype), full[1].to(dtype))},
+                                {"full_attention": masks["full_attention"]})
+        return self.head(hidden)[0, 0]
+
+
+class CodedRealiser(OnePassRealiser):
+    """A3-oracle (no ``predictor``): the code at q is the quantised encoding of the true next block, so it
+    conditions on the reference and is never the method (agreement 5). A3 (a ``predictor``): the code at q is the
+    codebook's vector at the predictor's argmax, and the predictor learns the encoder's codes by cross-entropy (D8).
+    Either code takes the place of A3-0's one vector; the slots are A3-0's otherwise (``slot_input``, ``depth``)."""
+
+    def __init__(self, drafter: Any, slots: int, slot_input: str, encoder: BlockEncoder, quantiser: VectorQuantiser,
+                 predictor: CodePredictor | None = None) -> None:
+        super().__init__(drafter, slots, torch.zeros(quantiser.dim), slot_input)
+        self.code.requires_grad_(False)                 # unused: the code comes from the codebook
+        self.encoder, self.quantiser, self.predictor = encoder, quantiser, predictor
+
+    @property
+    def source(self) -> str:
+        return "oracle" if self.predictor is None else "predicted"
+
+    def codes(self, states: tuple[Tensor, dict[str, tuple[Tensor, Tensor]], Tensor], batch: RolloutBatch,
+              hidden: Tensor, positions: Tensor, valid: Tensor) -> tuple[Tensor, dict[str, Any]]:
+        """The code of every drafted position and what came with it: the commitment loss (A3-oracle), or the
+        predictor's cross-entropy against the encoder's codes and its hits (A3)."""
+        if self.predictor is None:
+            code, index, commitment = self.quantiser(self.encoder(hidden, positions, batch.length), valid)
+            return code, {"commitment": commitment, "index": index}
+        with torch.no_grad():
+            truth = self.quantiser.nearest(self.encoder(hidden, positions, batch.length))
+        logits = self.predictor(states, positions)
+        index = logits.argmax(-1)
+        loss = F.cross_entropy(logits[valid].float(), truth[valid], reduction="sum")
+        return self.quantiser.embed[index], {"predictor": loss, "predictor_hits": (index == truth)[valid].sum(),
+                                             "index": index, "truth": truth}
+
+    def forward(self, states: tuple[Tensor, dict[str, tuple[Tensor, Tensor]], Tensor], batch: RolloutBatch
+                ) -> tuple[Tensor, Tensor, Tensor, dict[str, Any]]:
+        return self._draft(states, batch, lambda hidden, positions, valid: self.codes(states, batch, hidden,
+                                                                                    positions, valid))
+
+    def decode_code(self, token: Tensor, previous: Tensor, kv: dict[str, tuple[Tensor, Tensor]], position: int
+                    ) -> Tensor:
+        """A3's code of one decoding cycle: the codebook's vector at the predictor's argmax. A3-oracle has no code to
+        decode with: its code is the true block's."""
+        if self.predictor is None:
+            raise ValueError("A3-oracle's code is the true next block's: it is counted, never decoded")
+        logits = self.predictor.decode_logits(token, previous, kv["full_attention"], position)
+        return self.quantiser.embed[int(logits.argmax())]
+
+    def code_loss(self, states: tuple[Tensor, dict[str, tuple[Tensor, Tensor]], Tensor], batch: RolloutBatch
+                  ) -> dict[str, Any]:
+        """A3's training pass: the predictor's cross-entropy against the encoder's codes, without the slots."""
+        if self.predictor is None:
+            raise ValueError("only A3 has a predictor to train")
+        hidden, _, _ = _drafter_inputs(self.drafter, states)
+        positions, valid = query_positions(batch)
+        _, aux = self.codes(states, batch, hidden, positions, valid)
+        return {**aux, "valid": valid}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -425,6 +701,24 @@ def tokens_per_cycle(hits: Sequence[Sequence[Sequence[bool]]], length: int) -> t
     return cycles, positions
 
 
+def _code_statistics(sums: dict[str, Any], aux: dict[str, Any], valid: Tensor) -> None:
+    """How often each code is chosen at the valid positions, and how often the predictor's code is the encoder's."""
+    index = aux.get("index")
+    if index is not None:
+        chosen = index[valid].flatten().cpu()
+        counts = torch.bincount(chosen, minlength=CODE_COUNT_LENGTH).double()
+        sums["code_counts"] = sums["code_counts"] + counts if "code_counts" in sums else counts
+    if "predictor_hits" in aux:
+        sums["predictor_hits"] = sums.get("predictor_hits", 0.0) + float(aux["predictor_hits"])
+        sums["predictor_positions"] = sums.get("predictor_positions", 0.0) + float(valid.sum())
+
+
+def code_perplexity(counts: Tensor) -> float:
+    """exp of the entropy of the codes' shares."""
+    share = counts / counts.sum().clamp(min=1.0)
+    return float(torch.exp(-(share * torch.log(share.clamp(min=1e-12))).sum()))
+
+
 @torch.no_grad()
 def choice_hits(target: Any, drafter: Any, module: nn.Module | None, count: int, examples: Sequence[dict[str, Any]],
                 batch_size: int, pad_id: int, device: torch.device, vocab_chunk: int, clusters: Tensor | None
@@ -445,9 +739,12 @@ def choice_hits(target: Any, drafter: Any, module: nn.Module | None, count: int,
         if module is None:
             last, targets, scored = a2_hidden(drafter, states, batch, count)
         else:
-            last, targets, scored = module(states, batch)
+            out = module(states, batch)
+            last, targets, scored = out[:3]
             if last.shape[2] != count:
                 raise ValueError(f"the realiser has {last.shape[2]} slots, not {count}")
+            if len(out) > 3:
+                _code_statistics(sums, out[3], query_positions(batch)[1])
         rows, width = scored.shape[:2]
         hit_c = torch.zeros(rows, width, count, dtype=torch.bool, device=device)
         hit_o = torch.zeros_like(hit_c)
@@ -493,6 +790,11 @@ class TrainConfig:
     slots: int = 8                         # A3-0: B
     cluster_weight: float = 1.0            # S7's cluster term (A3-0 too: the author's decision of 27 November 2026)
     slot_input: str = "replace"            # A3-0: "replace" (D4 as registered) or "add" (x_q's embedding kept)
+    codes: int = 256                       # A3-oracle, A3: C (D3)
+    code_width: int = 64                   # A3-oracle: the encoder's width per position
+    code_scale: float = 0.1                # A3-oracle: the encodings' RMS at the start / the token embedding's
+    commitment: float = 0.25               # A3-oracle: beta of the commitment loss (D8)
+    codebook_decay: float = 0.99           # A3-oracle: the codebook's moving averages
     micro_batch: int = 0                   # 0: the arm's own (A2: the whole batch, as timed; A3-0: 8)
     eval_depths: int = 8
     eval_every: int = 2_500
@@ -508,6 +810,8 @@ class TrainConfig:
             raise ValueError("cluster_weight must not be negative")
         if self.slot_input not in SLOT_INPUTS:
             raise ValueError(f"slot_input must be one of {SLOT_INPUTS}")
+        if self.codes < 2 or self.code_width < 1 or self.code_scale <= 0 or not 0 < self.codebook_decay < 1:
+            raise ValueError("codes >= 2, code_width >= 1, code_scale > 0 and 0 < codebook_decay < 1")
         if self.micro_batch <= 0:
             self.micro_batch = self.batch if self.arm == "a2" else min(self.batch, 8)
         self.micro_batch = min(self.micro_batch, self.batch)
@@ -585,6 +889,7 @@ class DrafterTrainer:
         self.step_seconds: list[float] = []
         self.micro_batch = cfg.micro_batch
         self.halvings = 0
+        self.quantiser = module.quantiser if cfg.arm == "a3-oracle" else None
 
     def hidden(self, batch: RolloutBatch) -> tuple[Tensor, Tensor, Tensor]:
         states = target_states(self.target, batch)
@@ -601,24 +906,40 @@ class DrafterTrainer:
         return [float(scored[:, :, k].sum()) for k in range(count)]
 
     def accumulate(self, examples: Sequence[dict[str, Any]], counts: Sequence[float]) -> dict[str, Any]:
-        """The batch's gradient in ``self.micro_batch``-sized parts, added up in the parameters' ``grad``."""
+        """The batch's gradient in ``self.micro_batch``-sized parts, added up in the parameters' ``grad``. A3-oracle
+        adds its commitment loss and A3 has only its predictor's cross-entropy, each divided by the batch's drafted
+        positions (``counts[0]``: every drafted position scores slot 1), so that the parts add up here too."""
         cfg = self.cfg
         self.optimizer.zero_grad(set_to_none=True)
         loss_total, positions, tokens = 0.0, 0, 0
-        sums = {"token_nll": [0.0] * len(counts), "cluster_nll": [0.0] * len(counts)}
+        sums: dict[str, Any] = {"token_nll": [0.0] * len(counts), "cluster_nll": [0.0] * len(counts),
+                                "commitment": 0.0, "predictor_nll": 0.0, "predictor_hits": 0.0}
         for s in range(0, len(examples), self.micro_batch):
             batch = collate(examples[s:s + self.micro_batch], self.pad_id).to(self.device)
-            last, targets, scored = self.hidden(batch)
-            loss, stats = depth_loss(self.drafter, last, targets, scored, self.clusters, cfg.cluster_weight,
-                                     cfg.vocab_chunk, counts)
+            if cfg.arm == "a3":
+                aux = self.module.code_loss(target_states(self.target, batch), batch)
+                loss = aux["predictor"] / counts[0]
+                sums["predictor_nll"] += float(aux["predictor"].detach())
+                sums["predictor_hits"] += float(aux["predictor_hits"])
+                scored_first = int(aux["valid"].sum())
+            else:
+                out = self.hidden(batch)
+                last, targets, scored = out[:3]
+                loss, stats = depth_loss(self.drafter, last, targets, scored, self.clusters, cfg.cluster_weight,
+                                         cfg.vocab_chunk, counts)
+                if len(out) > 3 and "commitment" in out[3]:
+                    loss = loss + out[3]["commitment"] / counts[0]
+                    sums["commitment"] += float(out[3]["commitment"].detach())
+                for key in ("token_nll", "cluster_nll"):
+                    sums[key] = [a + b for a, b in zip(sums[key], stats[key], strict=True)]
+                scored_first = int(scored[:, :, 0].sum())
+                del out, last, targets, scored
             if loss.requires_grad:
                 loss.backward()
             loss_total += float(loss.detach())
-            for key in sums:
-                sums[key] = [a + b for a, b in zip(sums[key], stats[key], strict=True)]
-            positions += int(scored[:, :, 0].sum())
+            positions += scored_first
             tokens += int(batch.valid.sum())
-            del last, targets, scored, loss
+            del loss
         return {"loss": loss_total, "positions": positions, "tokens": tokens, **sums}
 
     def train_step(self) -> dict[str, float]:
@@ -637,6 +958,8 @@ class DrafterTrainer:
                 if not _is_out_of_memory(error) or self.micro_batch == 1:
                     raise
             self.optimizer.zero_grad(set_to_none=True)
+            if self.quantiser is not None:
+                self.quantiser.discard()                    # the halves count the batch's assignments again
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -652,6 +975,13 @@ class DrafterTrainer:
         row: dict[str, float] = {"loss": result["loss"], "lr": lr, "grad_norm": float(grad_norm),
                                  "positions": float(result["positions"]), "tokens": float(result["tokens"]),
                                  "micro_batch": float(self.micro_batch), "halvings": float(self.halvings)}
+        if self.quantiser is not None:
+            row.update(self.quantiser.apply())
+            row["commitment"] = result["commitment"] / max(counts[0], 1.0)
+        if cfg.arm == "a3":
+            row["predictor_nll"] = result["predictor_nll"] / max(counts[0], 1.0)
+            row["predictor_accuracy"] = result["predictor_hits"] / max(counts[0], 1.0)
+            return row
         for k, n in enumerate(counts):
             if n:
                 row[f"token_nll_{k + 1}"] = result["token_nll"][k] / n
@@ -674,6 +1004,11 @@ class DrafterTrainer:
                 metrics[f"hit_{k + 1}"] = sums["clustered"][k] / sums["n"][k]
                 metrics[f"hit_overall_{k + 1}"] = sums["overall"][k] / sums["n"][k]
                 metrics[f"token_nll_{k + 1}"] = sums["nll"][k] / sums["n"][k]
+        if "code_counts" in sums:
+            metrics["code_perplexity"] = code_perplexity(sums["code_counts"])
+            metrics["codes_used"] = float((sums["code_counts"] > 0).sum())
+        if sums.get("predictor_positions"):
+            metrics["predictor_accuracy"] = sums["predictor_hits"] / sums["predictor_positions"]
         lengths = sorted({g for g in EVAL_LENGTHS if g <= count} | (set() if cfg.arm == "a2" else {count}))
         for g in lengths:
             for name, hits in (("", hits_clustered), ("overall_", hits_overall)):
@@ -729,6 +1064,72 @@ class DrafterTrainer:
             self.logger.log(self.step, metrics, prefix=prefix)
 
 
+def embedding_rms(target: Any, samples: int = 4_096, seed: int = 0) -> float:
+    """The root mean square of the target's input embeddings (as the drafter receives them) over random tokens."""
+    embed = target.get_input_embeddings()
+    vocab = embed.weight.shape[0]
+    ids = torch.randint(0, vocab, (1, min(samples, vocab)), generator=torch.Generator().manual_seed(seed))
+    with torch.no_grad():
+        return float(embed(ids.to(embed.weight.device)).float().pow(2).mean().sqrt())
+
+
+def start_encoder(encoder: BlockEncoder, scale: float, seed: int = 0) -> float:
+    """Scales the encoder's output layer so that its encodings of standard normal states have the root mean square
+    ``scale`` (the code starts small beside the token embedding it is added to); returns the factor."""
+    generator = torch.Generator().manual_seed(seed)
+    weight = encoder.inner.weight
+    states = torch.randn(1, encoder.slots + 2, encoder.hidden, generator=generator).to(weight.device, weight.dtype)
+    with torch.no_grad():
+        positions = torch.zeros(1, 1, dtype=torch.long, device=weight.device)
+        length = torch.tensor([encoder.slots + 2], device=weight.device)
+        rms = float(encoder(states, positions, length).pow(2).mean().sqrt())
+        factor = scale / max(rms, 1e-12)
+        encoder.outer.weight.mul_(factor)
+        encoder.outer.bias.mul_(factor)
+    return factor
+
+
+def build_module(cfg: TrainConfig, target: Any, tokenizer: Any, drafter: Any, source: Path,
+                 device: torch.device) -> nn.Module:
+    """What an arm trains: A2, the drafter itself; A3-0, the one-pass realiser around it; A3-oracle, the coded
+    realiser with a new encoder and codebook; A3, the predictor of the coded realiser that ``source`` holds (A3-oracle's
+    final directory: its drafter, depth vectors, encoder and codebook stay as they are)."""
+    if cfg.arm == "a2":
+        return drafter
+    if cfg.arm == "a3-0":
+        code = mask_code(target, tokenizer)
+        if cfg.slot_input == "add":
+            code = torch.zeros_like(code)                         # every slot starts as A2's depth 1
+        return OnePassRealiser(drafter, cfg.slots, code, cfg.slot_input).to(device)
+    if cfg.arm == "a3-oracle":
+        width = target.get_input_embeddings().weight.shape[1]
+        hidden = int(target.config.get_text_config().hidden_size)
+        dtype = drafter.pre_projection.weight.dtype
+        encoder = BlockEncoder(hidden, cfg.slots, width, cfg.code_width).to(device=device, dtype=dtype)
+        start_encoder(encoder, cfg.code_scale * embedding_rms(target), cfg.seed)
+        quantiser = VectorQuantiser(cfg.codes, width, cfg.codebook_decay, cfg.commitment).to(device)
+        return CodedRealiser(drafter, cfg.slots, cfg.slot_input, encoder, quantiser).to(device)
+    base = load_realiser(source, drafter) if (Path(source) / "realiser.pt").exists() else None
+    if not isinstance(base, CodedRealiser) or base.source != "oracle":
+        raise SystemExit(f"A3 trains the predictor of A3-oracle's realiser, and {source} holds none")
+    if (base.slots, base.slot_input, base.quantiser.codes) != (cfg.slots, cfg.slot_input, cfg.codes):
+        raise SystemExit(f"{source} has {base.slots} slots, slot input {base.slot_input!r} and "
+                         f"{base.quantiser.codes} codes; this run asks for {cfg.slots}, {cfg.slot_input!r}, {cfg.codes}")
+    for parameter in base.parameters():
+        parameter.requires_grad_(False)
+    predictor = CodePredictor(one_layer_drafter(drafter), base.quantiser.codes)
+    for parameter in predictor.parameters():
+        parameter.requires_grad_(False)
+    for parameter in predictor.trainable():
+        parameter.requires_grad_(True)
+    module = CodedRealiser(drafter, base.slots, base.slot_input, base.encoder, base.quantiser, predictor)
+    with torch.no_grad():
+        module.depth.copy_(base.depth)
+    module.depth.requires_grad_(False)
+    module.quantiser.eval()
+    return module.to(device)
+
+
 def save_final(trainer: DrafterTrainer, source: Path, out: Path) -> Path:
     """``RUN/final``: the drafter as a ``Gemma4AssistantForCausalLM`` directory beside the other files of the drafter
     it started from (A3-0: and ``realiser.pt``)."""
@@ -738,9 +1139,7 @@ def save_final(trainer: DrafterTrainer, source: Path, out: Path) -> Path:
                                                                ".complete", ".cache", "realiser.pt", "training.json"))
     trainer.drafter.save_pretrained(tmp)
     if isinstance(trainer.module, OnePassRealiser):
-        torch.save({"slots": trainer.module.slots, "slot_input": trainer.module.slot_input,
-                    "code": trainer.module.code.detach().cpu(), "depth": trainer.module.depth.detach().cpu()},
-                   tmp / "realiser.pt")
+        torch.save(realiser_payload(trainer.module), tmp / "realiser.pt")
     with open(tmp / "training.json", "w", encoding="utf-8") as handle:
         json.dump({"arm": trainer.cfg.arm, "step": trainer.step, "config": trainer.cfg.to_dict(),
                    "started_from": str(source)}, handle, indent=2)
@@ -749,14 +1148,50 @@ def save_final(trainer: DrafterTrainer, source: Path, out: Path) -> Path:
     return out
 
 
+def realiser_payload(module: OnePassRealiser) -> dict[str, Any]:
+    """What ``realiser.pt`` holds: A3-0's slots, slot input, code and depth vectors; A3-oracle's and A3's encoder
+    and codebook with their sizes, and A3's predictor."""
+    out: dict[str, Any] = {"slots": module.slots, "slot_input": module.slot_input,
+                           "code": module.code.detach().cpu(), "depth": module.depth.detach().cpu()}
+    if isinstance(module, CodedRealiser):
+        e, q = module.encoder, module.quantiser
+        out["source"] = module.source
+        out["encoder"] = {"hidden": e.hidden, "slots": e.slots, "code_dim": e.code_dim, "width": e.width,
+                          "state": {k: v.detach().cpu() for k, v in e.state_dict().items()}}
+        out["quantiser"] = {"codes": q.codes, "dim": q.dim, "decay": q.decay, "beta": q.beta,
+                            "restart_below": q.restart_below,
+                            "state": {k: v.detach().cpu() for k, v in q.state_dict().items()}}
+        if module.predictor is not None:
+            out["predictor"] = {"codes": q.codes, "state": module.predictor.trained_state()}
+    return out
+
+
 def load_realiser(directory: Path, drafter: Any) -> OnePassRealiser:
-    """A3's realiser of a final directory (``save_final``) around its drafter, loaded already (a run saved before
-    ``slot_input`` existed is ``replace``)."""
+    """A3's realiser of a final directory (``save_final``) around its drafter, loaded already: A3-0's (a run saved
+    before ``slot_input`` existed is ``replace``), or A3-oracle's or A3's with their encoder, codebook and
+    predictor."""
     saved = torch.load(Path(directory) / "realiser.pt", map_location="cpu", weights_only=True)
-    realiser = OnePassRealiser(drafter, int(saved["slots"]), saved["code"], str(saved.get("slot_input", "replace")))
+    device, dtype = drafter.pre_projection.weight.device, drafter.pre_projection.weight.dtype
+    slot_input = str(saved.get("slot_input", "replace"))
+    if "encoder" in saved:
+        e, q = saved["encoder"], saved["quantiser"]
+        encoder = BlockEncoder(int(e["hidden"]), int(e["slots"]), int(e["code_dim"]), int(e["width"]))
+        encoder.load_state_dict(e["state"])
+        quantiser = VectorQuantiser(int(q["codes"]), int(q["dim"]), float(q["decay"]), float(q["beta"]),
+                                    float(q["restart_below"]))
+        quantiser.load_state_dict(q["state"])
+        predictor = None
+        if "predictor" in saved:
+            predictor = CodePredictor(one_layer_drafter(drafter), int(saved["predictor"]["codes"]))
+            predictor.load_trained(saved["predictor"]["state"])
+        realiser: OnePassRealiser = CodedRealiser(drafter, int(saved["slots"]), slot_input,
+                                                  encoder.to(device=device, dtype=dtype),
+                                                  quantiser.to(device), predictor)
+    else:
+        realiser = OnePassRealiser(drafter, int(saved["slots"]), saved["code"], slot_input)
     with torch.no_grad():
         realiser.depth.copy_(saved["depth"].to(realiser.depth.dtype))
-    return realiser.to(drafter.pre_projection.weight.device)
+    return realiser.to(device)
 
 
 def timing(trainer: DrafterTrainer, skip: int = 10) -> dict[str, Any]:
@@ -833,13 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
     for parameter in target.parameters():
         parameter.requires_grad_(False)
     drafter = Gemma4AssistantForCausalLM.from_pretrained(str(args.assistant), dtype=torch.float32).to(device)
-    if args.arm == "a2":
-        module: nn.Module = drafter
-    else:
-        code = mask_code(target, tokenizer)
-        if cfg.slot_input == "add":
-            code = torch.zeros_like(code)                         # every slot starts as A2's depth 1
-        module = OnePassRealiser(drafter, cfg.slots, code, cfg.slot_input).to(device)
+    module = build_module(cfg, target, tokenizer, drafter, args.assistant, device)
     stream = EpochStream(records, cfg.seed, payload["stream"] if payload else None)
     logger = MetricLogger(run, enabled=True)
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0

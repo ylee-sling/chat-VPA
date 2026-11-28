@@ -145,6 +145,80 @@ def _accepted_prefix_class() -> Any:
     return AcceptedPrefixKeys
 
 
+# The A3 realiser of each drafter loaded from a directory with a ``realiser.pt`` (A3-0, A3), by the drafter's id.
+_ONE_PASS: dict[int, Any] = {}
+
+
+@torch.no_grad()
+def one_pass_drafts(realiser: Any, embeddings: Any, last_token: Tensor, last_hidden: Tensor,
+                    kv: dict[str, tuple[Tensor, Tensor]], attention_mask: Tensor | None, position: int, count: int
+                    ) -> Tensor:
+    """One cycle's ``count`` drafts in one call of the realiser's drafter (D7; docs/e1.md, Section 11.13). Slot j's
+    input is x_q's embedding plus the cycle's code and depth vector j (``add``; under ``replace``, the code and depth
+    vector alone), beside the target's last hidden state, every slot at position q. The slots run as a batch of
+    ``count`` single-query calls, each the call Transformers makes for Google's drafter, with the accepted prefix's
+    keys ``kv``; a draft is the drafter's clustered argmax, as Transformers drafts. Returns ``[1, count]``."""
+    drafter = realiser.drafter
+    dtype = drafter.pre_projection.weight.dtype
+    token = embeddings(last_token).to(dtype)                                  # [1, 1, D]
+    previous = last_hidden.to(dtype)                                          # [1, 1, D]
+    code = realiser.decode_code(token, previous, kv, position).to(dtype)      # [D]
+    slot = code + realiser.depth[:count]                                      # [count, D]
+    first = token[0] + slot if realiser.slot_input == "add" else slot
+    inputs = torch.cat([first, previous[0].expand(count, -1)], dim=-1)[:, None]
+    shared = {name: (k.expand(count, -1, -1, -1), v.expand(count, -1, -1, -1)) for name, (k, v) in kv.items()}
+    mask = None if attention_mask is None else attention_mask.expand(count, -1)
+    positions = torch.full((count, 1), position, dtype=torch.long, device=inputs.device)
+    out = drafter(inputs_embeds=inputs, attention_mask=mask, position_ids=positions, shared_kv_states=shared,
+                  use_cache=False)
+    return out.logits[:, 0].argmax(-1)[None]
+
+
+@lru_cache(maxsize=1)
+def _one_pass_class() -> Any:
+    """``SinglePositionMultiTokenCandidateGenerator`` that drafts a cycle in one call (``one_pass_drafts``) for a
+    drafter with an A3 realiser; for any other drafter it is Transformers' own."""
+    from transformers.generation.candidate_generator import SinglePositionMultiTokenCandidateGenerator
+
+    class OnePassCandidates(SinglePositionMultiTokenCandidateGenerator):
+        def get_candidates(self, input_ids: Tensor, model_kwargs: dict[str, Any], model_outputs: Any,
+                           is_first_iteration: bool, n_last_matches: int, **kwargs: Any) -> Any:
+            realiser = _ONE_PASS.get(id(self.assistant_model))
+            if realiser is None:
+                return super().get_candidates(input_ids, model_kwargs, model_outputs, is_first_iteration,
+                                              n_last_matches, **kwargs)
+            if is_first_iteration:                                            # as Transformers: the prefill first
+                return input_ids, None
+            count = min(int(self.num_assistant_tokens), self.main_model_max_length - input_ids.shape[1] - 1,
+                        realiser.slots)
+            if count <= 0:
+                return input_ids, None
+            hidden = model_outputs.hidden_states[-1]
+            position = input_ids.shape[1] - 1
+            kv = accepted_prefix(model_outputs.shared_kv_states, position)
+            last = hidden[:, -1:] if self.is_main_model_prefill else hidden[:, n_last_matches:n_last_matches + 1]
+            drafts = one_pass_drafts(realiser, self.target_model_input_embeddings, input_ids[:, -1:], last, kv,
+                                     model_kwargs.get("attention_mask"), position, count)
+            self.is_main_model_prefill = False
+            return torch.cat([input_ids, drafts.to(input_ids.device)], dim=1), None
+
+    return OnePassCandidates
+
+
+@contextmanager
+def one_pass_candidates() -> Iterator[None]:
+    """Within the block, ``generate`` builds ``OnePassCandidates`` where it would build Transformers' MTP candidate
+    generator."""
+    import transformers.generation.utils as generation
+
+    original = generation.SinglePositionMultiTokenCandidateGenerator
+    generation.SinglePositionMultiTokenCandidateGenerator = _one_pass_class()
+    try:
+        yield
+    finally:
+        generation.SinglePositionMultiTokenCandidateGenerator = original
+
+
 @contextmanager
 def accepted_prefix_keys() -> Iterator[None]:
     """Within the block, ``generate`` builds ``AcceptedPrefixKeys`` where it would build Transformers' MTP
@@ -225,9 +299,15 @@ def decode_once(model: Any, assistant: Any, ids: Tensor, arm: Arm, max_new_token
     elif arm.kind == "lookup":
         kwargs["prompt_lookup_num_tokens"] = arm.length
     arrival = _Arrival(sync)
+    realiser = _ONE_PASS.get(id(drafter_model)) if drafter_model is not None else None
+    if realiser is not None and arm.clean:
+        raise ValueError(f"{arm.name}: a one-pass drafter always drafts with the accepted prefix's keys; drop ':clean'")
+    body = getattr(getattr(realiser, "predictor", None), "body", None)
+    predictor_body = body.model if body is not None else None         # A3's predictor runs its decoder only
     target = PassCounter(model, sync if profile else None)
     drafter = PassCounter(drafter_model, sync if profile else None)
-    keys = accepted_prefix_keys() if arm.clean else _nothing()
+    predictor = PassCounter(predictor_body, sync if profile else None)
+    keys = one_pass_candidates() if realiser is not None else accepted_prefix_keys() if arm.clean else _nothing()
     try:
         with keys:
             sync()
@@ -238,13 +318,16 @@ def decode_once(model: Any, assistant: Any, ids: Tensor, arm: Arm, max_new_token
     finally:
         target.close()
         drafter.close()
+        predictor.close()
     tokens = output[0, ids.shape[1]:].tolist()
     first = (arrival.first_time - start) if arrival.first_time is not None else end - start
     record = {"tokens": tokens, "seconds": end - start, "first_seconds": first,
               "first_tokens": arrival.first_tokens if arrival.first_time is not None else len(tokens),
               "target_passes": target.calls, "drafter_passes": drafter.calls}
+    if predictor_body is not None:
+        record["predictor_passes"] = predictor.calls
     if profile:
-        record.update(target_seconds=target.seconds, drafter_seconds=drafter.seconds)
+        record.update(target_seconds=target.seconds, drafter_seconds=drafter.seconds + predictor.seconds)
     return record
 
 
@@ -340,10 +423,19 @@ def _markdown(summary: dict[str, dict[str, Any]]) -> str:
 
 
 def load_assistant(path: str | Path, dtype: str, device: torch.device) -> Any:
-    """Google's drafter (``Gemma4AssistantForCausalLM``), frozen, on ``device``."""
+    """Google's drafter (``Gemma4AssistantForCausalLM``), frozen, on ``device``. A directory that also holds a
+    ``realiser.pt`` (A3-0, A3) drafts one cycle in one call: its realiser is registered for ``one_pass_candidates``."""
     from transformers import Gemma4AssistantForCausalLM
 
-    return Gemma4AssistantForCausalLM.from_pretrained(str(path), dtype=torch_dtype(dtype)).to(device).eval()
+    drafter = Gemma4AssistantForCausalLM.from_pretrained(str(path), dtype=torch_dtype(dtype)).to(device).eval()
+    if (Path(path) / "realiser.pt").exists():
+        from chat_vpa.e1_train import load_realiser
+
+        realiser = load_realiser(Path(path), drafter).eval()
+        if getattr(realiser, "source", "") == "oracle":
+            raise ValueError(f"{path} is A3-oracle's: its code is the true next block's, counted and never decoded")
+        _ONE_PASS[id(drafter)] = realiser
+    return drafter
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -21,7 +21,20 @@
 #                                         break-even, A3-0's training from A2's weights (D4) and the counts along the
 #                                         development prompts' continuations; about 21 hours (predicted)
 #   bash scripts/ncp/e1_step1.sh run-a3 add   the same in the foreground
-#   bash scripts/ncp/e1_step1.sh show-a3  where it stands, the break-even and the counts; no GPU
+#   bash scripts/ncp/e1_step1.sh show-a3  where every A3 run stands: the break-even, the training curves, the counts,
+#                                         the oracle gate and the one-pass tables' readings; no GPU
+#   bash scripts/ncp/e1_step1.sh a3-measure
+#                                         A3-0's speed (docs/e1.md, Section 11.13), in tmux (session e1-a3m): the
+#                                         float32 L4 table of ar, A1 and A2 at their best G (both kinds of keys) and
+#                                         A3-0 at G = 2, 4, 6, 8 through its own loop; its readings; about 2.2 hours
+#   bash scripts/ncp/e1_step1.sh a3-oracle
+#                                         A3-oracle (Section 11.13), in tmux (session e1-a3o): its training from the
+#                                         weights A3-0 started from, with A3-0's slot input, then the counts of A1,
+#                                         A2, A3-0 and A3-oracle with the oracle gate of Section 6.1; about 21 hours
+#   bash scripts/ncp/e1_step1.sh a3-predict
+#                                         A3 (Section 11.13), in tmux (session e1-a3p): its predictor trained on
+#                                         A3-oracle's frozen realiser and codebook, the counts, its float32 table and
+#                                         readings; it refuses to start unless the oracle gate let A3 be trained
 #
 # A2's parts, each skipped once done, so the command can be given again after a failure:
 #   rollouts  chat_vpa/e1_rollouts.py: the training prompts 0 to 99,999 (resuming after the timing run's first
@@ -43,6 +56,9 @@
 #              accepting fewer tokens than A1 in the float32 table (then from A1's); held-out curves every 2,500 steps
 #   count      chat_vpa/e1_count.py: A1, A2 and A3-0 counted along the float32 table's continuations of the
 #              development prompts (runs/e1-step1/count/a3-0/count.md); counted, not timed
+# Every later A3 action is one command of its own, for the author to start (each needs GPU time): a3-measure
+# (runs/e1-step1/measure/l4-fp32-a30), a3-oracle (runs/e1-step1/a3-oracle, runs/e1-step1/count/a3-oracle) and
+# a3-predict (runs/e1-step1/a3, runs/e1-step1/count/a3, runs/e1-step1/measure/l4-fp32-a3).
 #
 # 1. the rollout writer (chat_vpa/e1_rollouts.py) on the first chunk of 2,048 of the 100,000 training prompts:
 #    the first chunk of the full run, which resumes after it; it also counts the training prompts that are the
@@ -99,6 +115,9 @@ EXTRA_COUNT="${EXTRA_COUNT:-}"
 case "$ACTION" in
   a2|run-a2|show-a2) SESSION="${SESSION:-e1-a2}" ;;
   a3|run-a3|show-a3) SESSION="${SESSION:-e1-a3}" ;;
+  a3-measure|run-a3-measure) SESSION="${SESSION:-e1-a3m}" ;;
+  a3-oracle|run-a3-oracle)   SESSION="${SESSION:-e1-a3o}" ;;
+  a3-predict|run-a3-predict) SESSION="${SESSION:-e1-a3p}" ;;
   *)                 SESSION="${SESSION:-e1-timing}" ;;
 esac
 IT_MODEL="$ASSETS/models/gemma-4-E2B-it"
@@ -109,6 +128,8 @@ ROLLOUTS="$OUT/rollouts/train"
 HELD="$OUT/rollouts/held-out"
 A2="$OUT/a2"
 A3="$OUT/a3-0"
+A3O="$OUT/a3-oracle"
+A3P="$OUT/a3"
 MEASURE="$OUT/measure"
 VLLM_PY="$ASSETS/venvs/vllm/bin/python"
 
@@ -466,41 +487,146 @@ a3_runs() {
   log "A3-0 finished: bash scripts/ncp/e1_step1.sh show-a3"
 }
 
+# a3_variant: A3-0's slot input, which A3-oracle and A3 keep (Section 11.12).
+a3_variant() {
+  "$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["config"]["slot_input"])' "$A3/config.json"
+}
+
+# measure_one_pass <label> <run> <table>: a float32 L4 table of ar, A1 and A2 at their best G (both kinds of keys),
+# the one-pass drafters before it at their best G, and <label> at G = 2, 4, 6, 8; then its readings.
+measure_one_pass() {
+  local label="$1" run="$2" name="$3" g1 g2 g30 device=()
+  [[ -f "$run/final/realiser.pt" ]] || die "$label is not trained ($run)"
+  if [[ "$REQUIRE_GPU" != 1 ]]; then device=(--device cpu); fi
+  g1="$("$PY" -m chat_vpa.e1_readings best --table "$MEASURE/l4-fp32" --drafter a1)"
+  g2="$("$PY" -m chat_vpa.e1_readings best --table "$MEASURE/l4-fp32" --drafter a2)"
+  local drafters=(--drafter "a1=$DRAFTER" --drafter "a2=$A2/final" --drafter "a30=$A3/final")
+  local arms=(ar "a1:$g1" "a1:$g1:clean" "a2:$g2" "a2:$g2:clean")
+  if [[ "$label" == a3 ]]; then
+    [[ -f "$MEASURE/l4-fp32-a30/summary.json" ]] || die "A3-0's table is missing: bash scripts/ncp/e1_step1.sh a3-measure"
+    g30="$("$PY" -m chat_vpa.e1_readings best --table "$MEASURE/l4-fp32-a30" --drafter a30)"
+    drafters+=(--drafter "a3=$run/final")
+    arms+=("a30:$g30")
+  fi
+  arms+=("$label:2" "$label:4" "$label:6" "$label:8")
+  log "the $label table: ${arms[*]}"
+  # shellcheck disable=SC2086
+  step "$MEASURE/$name" hard "$PY" -m chat_vpa.e1_decode --model "$IT_MODEL" "${drafters[@]}" \
+    --prompts "$PROMPTS" --limit "$MEASURE_PROMPTS" --max-new-tokens "$MAX_NEW" --dtype fp32 --arms "${arms[@]}" \
+    --out "$MEASURE/$name" "${device[@]}" $EXTRA_DECODE
+  "$PY" -m chat_vpa.e1_readings one-pass --table "$MEASURE/$name" --drafter "$label" \
+    --breakeven "$OUT/breakeven/breakeven.json" --out "$MEASURE/$name" > /dev/null
+}
+
+a3_measure_runs() {
+  check_python
+  check_gpu_free
+  [[ -f "$A3/final/realiser.pt" ]] || die "A3-0 has not finished: bash scripts/ncp/e1_step1.sh show-a3"
+  measure_one_pass a30 "$A3" l4-fp32-a30
+  log "A3-0's table finished: bash scripts/ncp/e1_step1.sh show-a3"
+}
+
+# count_with_gate <out> [--drafter LABEL=PATH...]: A1, A2, A3-0 and the given drafters counted, with the oracle
+# gate of Section 6.1 read at G = B = 8 and the bars beside it.
+count_with_gate() {
+  local out="$1"; shift
+  local device=()
+  if [[ "$REQUIRE_GPU" != 1 ]]; then device=(--device cpu); fi
+  # shellcheck disable=SC2086
+  step "$out" hard "$PY" -m chat_vpa.e1_count --model "$IT_MODEL" --table "$MEASURE/l4-fp32" --prompts "$PROMPTS" \
+    --drafter "a1=$DRAFTER" --drafter "a2=$A2/final" --drafter "a3-0=$A3/final" "$@" --gate a3-oracle:a3-0 \
+    --gate-length 8 --breakeven "$OUT/breakeven/breakeven.json" --out "$out" "${device[@]}" $EXTRA_COUNT
+}
+
+a3_oracle_runs() {
+  check_python
+  check_gpu_free
+  [[ -f "$A3/final/realiser.pt" && -f "$A3/config.json" ]] || die "A3-0 has not finished: bash scripts/ncp/e1_step1.sh show-a3"
+  local variant start source more=()
+  variant="$(a3_variant)" || die "A3-0's slot input could not be read from $A3/config.json"
+  start="$(a3_start)" || die "R6 could not be read from $MEASURE/readings.json"
+  if [[ "$start" == a2 ]]; then source="$A2/final"; else source="$DRAFTER"; fi
+  log "A3-oracle starts from $start's weights, as A3-0 did, with A3-0's slot input '$variant'"
+  local sets=("slot_input=$variant")
+  if [[ -n "$EXTRA_TRAIN" ]]; then read -r -a more <<< "$EXTRA_TRAIN"; sets+=("${more[@]}"); fi
+  step "$A3O" hard "$PY" -m chat_vpa.e1_train --arm a3-oracle --model "$IT_MODEL" --assistant "$source" \
+    --rollouts "$ROLLOUTS" --held-out "$HELD" --run "$A3O" --set "${sets[@]}"
+  [[ -f "$A3O/final/realiser.pt" ]] || die "A3-oracle's training ended without its final checkpoint"
+  count_with_gate "$OUT/count/a3-oracle" --drafter "a3-oracle=$A3O/final"
+  log "A3-oracle finished: bash scripts/ncp/e1_step1.sh show-a3"
+}
+
+# oracle_allows: the gate of Section 6.1 as the counts read it.
+oracle_allows() {
+  "$PY" -c 'import json, sys; g = json.load(open(sys.argv[1]))["gate"]; sys.exit(0 if g["difference"]["low"] > 0 else 1)' \
+    "$OUT/count/a3-oracle/count.json"
+}
+
+a3_predict_runs() {
+  check_python
+  check_gpu_free
+  [[ -f "$A3O/final/realiser.pt" && -f "$OUT/count/a3-oracle/count.json" ]] \
+    || die "A3-oracle has not finished: bash scripts/ncp/e1_step1.sh a3-oracle"
+  oracle_allows || die "the oracle gate stops A3 (docs/e1.md, Section 6.1): bash scripts/ncp/e1_step1.sh show-a3"
+  local more=() sets=("slot_input=$(a3_variant)")
+  if [[ -n "$EXTRA_TRAIN" ]]; then read -r -a more <<< "$EXTRA_TRAIN"; sets+=("${more[@]}"); fi
+  step "$A3P" hard "$PY" -m chat_vpa.e1_train --arm a3 --model "$IT_MODEL" --assistant "$A3O/final" \
+    --rollouts "$ROLLOUTS" --held-out "$HELD" --run "$A3P" --set "${sets[@]}"
+  [[ -f "$A3P/final/realiser.pt" ]] || die "A3's training ended without its final checkpoint"
+  count_with_gate "$OUT/count/a3" --drafter "a3-oracle=$A3O/final" --drafter "a3=$A3P/final"
+  measure_one_pass a3 "$A3P" l4-fp32-a3
+  log "A3 finished: bash scripts/ncp/e1_step1.sh show-a3"
+}
+
 show_a3() {
   "$PY" - "$OUT" <<'PYEOF'
 import json, sys
 from pathlib import Path
 
 out = Path(sys.argv[1])
-print("== E1 Step 1, A3-0 (docs/e1.md, Sections 11.5, 11.12)")
+print("== E1 Step 1, A3 (docs/e1.md, Sections 11.5, 11.12, 11.13)")
 if (out / "breakeven" / "breakeven.md").exists():
     print((out / "breakeven" / "breakeven.md").read_text())
 else:
     print("breakeven: not computed (bash scripts/ncp/e1_step1.sh breakeven)")
-run = out / "a3-0"
-if (run / "metrics.jsonl").exists():
+for name in ("a3-0", "a3-oracle", "a3"):
+    run = out / name
+    if not (run / "metrics.jsonl").exists():
+        print(f"{name}: not started")
+        continue
     rows = [json.loads(line) for line in open(run / "metrics.jsonl", encoding="utf-8")]
     train = [r for r in rows if "train/loss" in r]
     evals = [r for r in rows if "eval/seconds" in r]
     meta = json.loads((run / "config.json").read_text())
     config = meta["config"]
-    print(f"a3-0: slot input '{config.get('slot_input', 'replace')}', from {meta['assistant']}")
+    print(f"{name}: slot input '{config.get('slot_input', 'replace')}', from {meta['assistant']}")
     if train:
         t = train[-1]
-        print(f"  step {t['step']} of {config['steps']}, loss {t['train/loss']:.3f}, {t['train/steps_per_s']:.3f} "
-              f"steps/s, {t.get('train/eta_h', 0):.1f} h left (predicted), peak {t.get('train/peak_memory_gib', 0):.1f} "
-              f"GiB, micro-batch {t.get('train/micro_batch', 0):.0f}"
+        codes = "".join(f", {label} {t[key]:.3f}" for key, label in (
+            ("train/code_perplexity", "code perplexity"), ("train/codes_used", "codes used"),
+            ("train/predictor_accuracy", "predictor accuracy")) if key in t)
+        print(f"  step {t['step']} of {config['steps']}, loss {t['train/loss']:.3f}{codes}, "
+              f"{t['train/steps_per_s']:.3f} steps/s, {t.get('train/eta_h', 0):.1f} h left (predicted), peak "
+              f"{t.get('train/peak_memory_gib', 0):.1f} GiB, micro-batch {t.get('train/micro_batch', 0):.0f}"
               + (", done" if (run / "final" / "realiser.pt").exists() else ""))
     for e in evals:
         cycles = "  ".join(f"G={k.rsplit('_', 1)[1]}: {v:.2f}" for k, v in e.items()
                            if k.startswith("eval/tokens_per_cycle_"))
         hits = " ".join(f"{e[f'eval/hit_{k}']:.3f}" for k in range(1, 9) if f"eval/hit_{k}" in e)
-        print(f"  held-out at step {e['step']}: tokens per cycle along the continuations {cycles}; hit by slot {hits}")
-else:
-    print("a3-0: not started")
-if (out / "count" / "a3-0" / "count.md").exists():
-    print()
-    print((out / "count" / "a3-0" / "count.md").read_text())
+        extra = "".join(f"; {label} {e[key]:.3f}" for key, label in (
+            ("eval/code_perplexity", "code perplexity"), ("eval/predictor_accuracy", "predictor accuracy"))
+            if key in e)
+        print(f"  held-out at step {e['step']}: tokens per cycle along the continuations {cycles}; hit by slot "
+              f"{hits}{extra}")
+for name in ("a3-0", "a3-oracle", "a3"):
+    if (out / "count" / name / "count.md").exists():
+        print()
+        print((out / "count" / name / "count.md").read_text())
+for table, label in (("l4-fp32-a30", "a30"), ("l4-fp32-a3", "a3")):
+    path = out / "measure" / table / f"one-pass-{label}.md"
+    if path.exists():
+        print()
+        print(path.read_text())
 PYEOF
 }
 
@@ -517,5 +643,11 @@ case "$ACTION" in
            start_tmux "$SESSION" "$OUT/a3.log" "bash scripts/ncp/e1_step1.sh run-a3 $2" ;;
   run-a3)  a3_runs "${2:-}"; show_a3 ;;
   show-a3) show_a3 ;;
-  *)       die "usage: e1_step1.sh [launch|run|show|a2|run-a2|show-a2|breakeven|a3 add|a3 replace|run-a3 VARIANT|show-a3]" ;;
+  a3-measure)     start_tmux "$SESSION" "$OUT/a3-measure.log" "bash scripts/ncp/e1_step1.sh run-a3-measure" ;;
+  run-a3-measure) a3_measure_runs; show_a3 ;;
+  a3-oracle)      start_tmux "$SESSION" "$OUT/a3-oracle.log" "bash scripts/ncp/e1_step1.sh run-a3-oracle" ;;
+  run-a3-oracle)  a3_oracle_runs; show_a3 ;;
+  a3-predict)     start_tmux "$SESSION" "$OUT/a3-predict.log" "bash scripts/ncp/e1_step1.sh run-a3-predict" ;;
+  run-a3-predict) a3_predict_runs; show_a3 ;;
+  *)       die "usage: e1_step1.sh [launch|run|show|a2|run-a2|show-a2|breakeven|a3 add|a3 replace|run-a3 VARIANT|show-a3|a3-measure|a3-oracle|a3-predict]" ;;
 esac

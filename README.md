@@ -63,10 +63,13 @@ check of LiteRT-LM's GPU backend, whose speculative decoding did not keep the mo
 (`bash scripts/ncp/e1_p2.sh`, run: undecided) and timing runs (`bash scripts/ncp/e1_step1.sh`, run); then, in one
 run (`bash scripts/ncp/e1_step1.sh a2`, run), the model's own greedy rollouts on English prompts and the first
 trained arm by Step 0's rules, A2: Google's drafter distilled on those rollouts, measured beside it. Now A3, a
-drafter that decides one latent code per block and drafts the block in one call, starting with its control A3-0
-(`bash scripts/ncp/e1_step1.sh a3 add`, once the author has named its slot input, Section 11.12), and, beside it
-without the GPU, P3: what LiteRT-LM's model file holds and whether its own builder repacks it unchanged
-(`bash scripts/ncp/e1_p3.sh`). B1, E0's Block-DFM as a drafter the model
+drafter that decides one latent code per block and drafts the block in one call: its control A3-0 is training
+(`bash scripts/ncp/e1_step1.sh a3 add`, running), and beside it, without the GPU, P3 read what LiteRT-LM's model
+file holds (`bash scripts/ncp/e1_p3.sh`, run: its drafter is not Google's Transformers drafter quantised). Built for
+what follows (Section 11.13): A3-0's speed through A3's own decoding loop (`bash scripts/ncp/e1_step1.sh
+a3-measure`), A3-oracle with the oracle gate (`a3-oracle`), A3 itself if the gate allows it (`a3-predict`), and a
+drafter's weights written into a copy of LiteRT-LM's file to measure it in that runtime (`bash scripts/ncp/e1_p3.sh
+route`, then `engine`). B1, E0's Block-DFM as a drafter the model
 verifies, which Step 0's bridge admitted (E0's checkpoints, unchanged, yield 2.6 tokens per backbone pass on
 MBPP code), waits for the author's sign-off after A2 and A3. Before any product claim the LiteRT-LM measurement
 runs on a physical laptop. Step 0 itself (`bash scripts/ncp/e1_setup.sh`, then `bash scripts/ncp/e1_step0.sh`) measured

@@ -210,6 +210,32 @@ def test_the_pytorch_readings_by_hand(tmp_path):
     assert "R7: decode rate a2-2 / a1-2 = 1.250 [1.250, 1.250]: a2 pays over a1 clearly" in text
 
 
+def test_a_one_pass_drafters_readings_by_hand(tmp_path):
+    plan = {"ar": (21, 2.0), "a1-2": (11, 1.25), "a1-2-clean": (11, 1.2), "a2-4": (7, 1.25), "a2-4-clean": (6, 1.2),
+            "a30-2": (11, 1.1), "a30-8": (8, 1.0)}
+    bars = {"bars": [{"against": "a1", "registered": True, "g": 2, "by_block": [{"b": 8, "tau_star": 1.816}]},
+                     {"against": "a2", "registered": False, "g": 4, "by_block": [{"b": 8, "tau_star": 1.922}]}]}
+    r = rd.read_one_pass(_table(tmp_path / "t", plan), "a30", bars=bars)
+    # 20 tokens per prompt after the first; decode rate = 20 / seconds: ar 10, a1-2 16, a1-2-clean 16.67, a2-4 16,
+    # a2-4-clean 16.67, a30-2 18.18, a30-8 20. Identical prompts: every interval is its point.
+    assert r["r2"]["a30"]["best_g"] == 8 and r["r2"]["a30"]["speedup"] == pytest.approx(2.0)
+    assert r["r1"]["a30-8"]["reading"] == "exact" and r["r1"]["a2-4"]["exact"] == 2
+    against = {(x["reference"], x["keys"]): x for x in r["against"]}
+    assert against[("a1-2", "Transformers'")]["ratio"]["point"] == pytest.approx(20 / 16)
+    assert against[("a1-2-clean", "accepted prefix")]["ratio"]["point"] == pytest.approx(1.2)
+    assert against[("a2-4", "Transformers'")]["reading"] == "a30 pays over a1 clearly".replace("a1", "a2")
+    assert r["tokens_per_cycle"]["a30-8"] == pytest.approx(20 / 7)
+    assert r["bars"][0]["by_block"] == {8: 1.816}
+    text = rd.render_one_pass(r)
+    assert "R7's rule, a30 at G = 8 against a1-2 (Transformers' keys): decode rate ratio 1.250 [1.250, 1.250]: a30 " \
+           "pays over a1 clearly" in text
+    assert "tau* 1.922 at B = 8 (predicted)" in text
+    assert rd.main(["one-pass", "--table", str(tmp_path / "t"), "--drafter", "a30", "--out", str(tmp_path / "o")]) == 0
+    assert (tmp_path / "o" / "one-pass-a30.md").exists()
+    with pytest.raises(SystemExit, match="no arm of a3"):
+        rd.main(["one-pass", "--table", str(tmp_path / "t"), "--drafter", "a3", "--out", str(tmp_path / "o")])
+
+
 def _vllm(path, drift):
     arms = {"off-1": {"decode_speedup": None, "same_tokens": 3, "prompts": 3, "tokens_per_cycle": None},
             "a1-2": {"decode_speedup": 1.5, "decode_speedup_interval": [1.4, 1.6], "same_tokens": 1, "prompts": 3,

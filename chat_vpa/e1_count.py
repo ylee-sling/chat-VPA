@@ -47,7 +47,7 @@ import torch
 
 from chat_vpa.e1_common import chat_ids, environment, file_sha256, read_prompts, torch_dtype, write_json
 
-__all__ = ["acceptance_profile", "continuations", "count_drafter", "compare", "render"]
+__all__ = ["acceptance_profile", "continuations", "count_drafter", "compare", "gate", "render"]
 
 LENGTHS = (2, 4, 6, 8)
 
@@ -124,8 +124,9 @@ def count_drafter(target: Any, path: Path, dtype: str, device: torch.device, exa
             torch.cuda.empty_cache()
         size = max(1, size // 2)
     per_prompt = {g: [tokens_per_cycle(h, g) for h in hits] for g in lengths if g <= count}
+    source = getattr(module, "source", "one vector") if module is not None else None
     out = {"path": str(path), "kind": "one pass" if module is not None else "sequential", "depths": count,
-           "slot_input": None if module is None else module.slot_input, "batch_size": size,
+           "slot_input": None if module is None else module.slot_input, "code": source, "batch_size": size,
            "per_prompt": {str(g): [list(x) for x in v] for g, v in per_prompt.items()},
            "tokens_per_cycle": {str(g): sum(t for _, t in v) / sum(c for c, _ in v) for g, v in per_prompt.items()},
            "hit": [sums["clustered"][k] / sums["n"][k] if sums["n"][k] else None for k in range(count)],
@@ -160,6 +161,43 @@ def compare(counts: dict[str, dict[str, Any]], resamples: int = 10_000, seed: in
     return out
 
 
+def _ratio(a: Any, b: Any) -> Any:
+    return a / b
+
+
+def gate(counts: dict[str, dict[str, Any]], comparisons: Sequence[dict[str, Any]], oracle: str, control: str,
+         length: int, bar: float | None = None, resamples: int = 10_000, seed: int = 0) -> dict[str, Any]:
+    """Section 6.1's oracle gate, read at G = ``length`` (A3's B): A3 is trained only if the oracle's tokens per
+    cycle are clearly above the control's (the interval of the difference above 0). Beside it, the oracle's tokens
+    per cycle with its interval against ``bar`` (tau* against A1 at B = ``length``): if the whole interval lies below
+    it, no predictor can make A3 faster than A1 in that table."""
+    from chat_vpa.e0_report import paired_bootstrap
+
+    if oracle not in counts or control not in counts:
+        raise ValueError(f"the gate needs counts of {oracle} and {control}")
+    key = str(length)
+    difference = next((x for x in comparisons if x["g"] == length and {x["later"], x["earlier"]} == {oracle, control}),
+                      None)
+    if difference is None:
+        raise ValueError(f"no comparison of {oracle} and {control} at G = {length}")
+    point = difference["difference"]
+    if difference["later"] != oracle:                  # the comparison is control - oracle: turn it round
+        point = {"point": -point["point"], "low": -point["high"], "high": -point["low"]}
+    above = point["low"] > 0
+    out: dict[str, Any] = {"oracle": oracle, "control": control, "g": length, "difference": point,
+                           "reading": ("the oracle is clearly above the control: A3 may be trained" if above else
+                                       "the oracle is not clearly above the control: A3 is not trained (6.1)")}
+    pairs = counts[oracle]["per_prompt"][key]
+    value, low, high = paired_bootstrap([[float(t) for _, t in pairs], [float(c) for c, _ in pairs]], _ratio,
+                                        resamples, seed)
+    out["oracle_tokens_per_cycle"] = {"point": value, "low": low, "high": high}
+    if bar is not None:
+        out["bar"] = bar
+        out["bar_reading"] = ("the oracle lies below tau* against A1: no predictor can make A3 faster than A1 here"
+                              if high < bar else "the oracle does not lie below tau* against A1")
+    return out
+
+
 def render(result: dict[str, Any]) -> str:
     """The counts as markdown; every number is *counted* along the table's continuations."""
     env = result["environment"]
@@ -174,7 +212,9 @@ def render(result: dict[str, Any]) -> str:
              "| drafter | kind | " + " | ".join(f"G = {g}" for g in lengths) + " | hit rate by depth |",
              "|---|---|" + "---|" * len(lengths) + "---|"]
     for label, c in counts.items():
-        kind = (f"one pass, {c['depths']} slots ({c['slot_input']})" if c["kind"] == "one pass"
+        code = {"oracle": "the true block's code: conditions on the reference", "predicted": "the predicted code",
+                "one vector": "one learned vector"}.get(c.get("code") or "", "")
+        kind = (f"one pass, {c['depths']} slots ({c['slot_input']}; {code})" if c["kind"] == "one pass"
                 else f"sequential, {c['depths']} depths")
         cells = " | ".join(f"{c['tokens_per_cycle'][str(g)]:.3f}" if str(g) in c["tokens_per_cycle"] else "--"
                            for g in lengths)
@@ -190,6 +230,13 @@ def render(result: dict[str, Any]) -> str:
             d = x["difference"]
             lines.append(f"| {x['later']} - {x['earlier']} | {x['g']} | {d['point']:+.3f} [{d['low']:+.3f}, "
                          f"{d['high']:+.3f}] | {x['reading']} |")
+    if result.get("gate"):
+        g = result["gate"]
+        d, o = g["difference"], g["oracle_tokens_per_cycle"]
+        lines += ["", f"**The oracle gate** (Section 6.1, at G = {g['g']}): {g['oracle']} - {g['control']} = "
+                  f"{d['point']:+.3f} [{d['low']:+.3f}, {d['high']:+.3f}] tokens per cycle: {g['reading']}. "
+                  f"{g['oracle']} alone: {o['point']:.3f} [{o['low']:.3f}, {o['high']:.3f}]"
+                  + (f" against tau* = {g['bar']:.3f}: {g['bar_reading']}." if "bar" in g else ".")]
     if result["measured_beside"]:
         lines += ["", "Beside them (described, not read): tokens per cycle that decoding measured in the table with "
                   "the accepted prefix's keys, against the count at the same G:"]
@@ -223,6 +270,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lengths", type=int, nargs="+", default=list(LENGTHS))
     p.add_argument("--dtype", default=None, choices=["bf16", "fp32"], help="default: the table's")
     p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--gate", default=None, metavar="ORACLE:CONTROL", help="read the oracle gate (Section 6.1)")
+    p.add_argument("--gate-length", type=int, default=8, help="the G at which the gate is read (A3's B)")
+    p.add_argument("--breakeven", type=Path, default=None, help="breakeven.json: tau* against A1 beside the gate")
     p.add_argument("--device", default="auto")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args(argv)
@@ -265,6 +315,14 @@ def main(argv: list[str] | None = None) -> int:
               "model": str(args.model), "environment": environment(device, dtype), "prompts": len(examples),
               "dropped": dropped, "tokens": sum(len(e["ids"]) - e["start"] - 1 for e in examples),
               "drafters": counts, "comparisons": compare(counts), "measured_beside": beside}
+    if args.gate:
+        oracle, _, control = args.gate.partition(":")
+        bar = None
+        if args.breakeven is not None:
+            bars = json.loads(args.breakeven.read_text(encoding="utf-8"))["bars"]
+            gate_bar = next(b for b in bars if b["registered"])
+            bar = next((x["tau_star"] for x in gate_bar["by_block"] if x["b"] == args.gate_length), None)
+        result["gate"] = gate(counts, result["comparisons"], oracle, control, args.gate_length, bar)
     args.out.mkdir(parents=True, exist_ok=True)
     write_json(args.out / "count.json", result)
     text = render(result)

@@ -226,7 +226,7 @@ def test_counts_are_a_walk_of_transformers_own_drafts(tiny, built, realiser, tmp
     assert x["difference"]["point"] == pytest.approx(by_hand)
     assert x["difference"]["low"] <= by_hand <= x["difference"]["high"]
     assert result["measured_beside"] == []
-    assert "| a3 | one pass, 3 slots (add) |" in (out / "count.md").read_text()
+    assert "| a3 | one pass, 3 slots (add; one learned vector) |" in (out / "count.md").read_text()
 
 
 def test_the_continuations_are_the_tables_and_its_prompt_file(tiny, table, tmp_path):  # noqa: F811
@@ -254,3 +254,26 @@ def test_the_continuations_are_the_tables_and_its_prompt_file(tiny, table, tmp_p
     with pytest.raises(SystemExit, match="LABEL=PATH"):
         ec.main(["--model", str(tiny / "model"), "--table", str(table), "--prompts", str(tiny / "prompts.jsonl"),
                  "--drafter", "a1", "--out", str(tmp_path / "x")])
+
+
+def test_the_oracle_gate_by_hand():
+    # Per prompt (cycles, tokens) at G = 8: the oracle needs fewer cycles on every prompt.
+    counts = {"a3-0": {"per_prompt": {"8": [[10, 20], [12, 20], [11, 20]]}},
+              "a3-oracle": {"per_prompt": {"8": [[8, 20], [9, 20], [8, 20]]}}}
+    comparisons = ec.compare(counts, resamples=500)
+    g = ec.gate(counts, comparisons, "a3-oracle", "a3-0", 8, bar=2.0, resamples=500)
+    assert g["difference"]["point"] == pytest.approx(60 / 25 - 60 / 33)
+    assert g["difference"]["low"] > 0 and "may be trained" in g["reading"]
+    assert g["oracle_tokens_per_cycle"]["point"] == pytest.approx(60 / 25)
+    assert "does not lie below" in g["bar_reading"]
+    # Counted in the other order, the comparison is control - oracle: the gate turns it round.
+    flipped = {"a3-oracle": counts["a3-oracle"], "a3-0": counts["a3-0"]}
+    h = ec.gate(flipped, ec.compare(flipped, resamples=500), "a3-oracle", "a3-0", 8, resamples=500)
+    assert h["difference"]["point"] == pytest.approx(g["difference"]["point"])
+    # Not clearly above: the oracle is worse on one prompt; and an oracle below the bar.
+    mixed = {"a3-0": counts["a3-0"], "a3-oracle": {"per_prompt": {"8": [[8, 20], [9, 20], [14, 20]]}}}
+    m = ec.gate(mixed, ec.compare(mixed, resamples=500), "a3-oracle", "a3-0", 8, bar=3.0, resamples=500)
+    assert m["difference"]["low"] <= 0 and "is not trained" in m["reading"]
+    assert "no predictor can make A3 faster than A1" in m["bar_reading"]
+    with pytest.raises(ValueError, match="no comparison"):
+        ec.gate(counts, comparisons, "a3-oracle", "a3-0", 4)
